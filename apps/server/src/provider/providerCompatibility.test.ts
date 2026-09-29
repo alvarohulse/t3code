@@ -67,6 +67,31 @@ describe("provider compatibility", () => {
     }
   });
 
+  it("keeps OpenCode 1.x ready while builds without a 2.x runtime mark 2.x broken", () => {
+    const openCode = ProviderDriverKind.make("opencode");
+    const bundled = ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility;
+    for (const [version, expected] of [
+      ["1.14.18", "broken"],
+      ["1.14.19", "supported"],
+      ["1.18.33", "supported"],
+      ["2.0.18", "broken"],
+    ] as const) {
+      assert.strictEqual(
+        resolveProviderCompatibility(bundled, openCode, version)?.status,
+        expected,
+        version,
+      );
+    }
+    // The advisory rides beside the probe: a ready 1.x instance stays ready and selectable.
+    const ready = applyProviderCompatibility(
+      { ...provider, driver: openCode, version: "1.18.33", status: "ready", message: undefined },
+      undefined,
+      bundled,
+    );
+    assert.strictEqual(ready.status, "ready");
+    assert.strictEqual(ready.compatibilityAdvisory?.status, "supported");
+  });
+
   it("compares Cursor build dates without treating semver prereleases as stable", () => {
     const cursor = ProviderDriverKind.make("cursor");
     const cursorPolicy: ProviderCompatibilityPolicy = {
