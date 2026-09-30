@@ -686,7 +686,7 @@ describe("OpenCode2 adapter", () => {
     () =>
       Effect.gen(function* () {
         const runtime = yield* openCode2ReplayRuntime([
-          out("event.subscribe"),
+          ...opening,
           out("session.get", { sessionID: SESSION }),
           replyData("session.get", sessionInfo()),
           out("session.move", { sessionID: SESSION, directory: "/work/opencode2-feature" }),

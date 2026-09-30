@@ -461,7 +461,8 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
     message,
   });
   if (result._tag === "Failure") {
-    const cause = Cause.squash(result.cause);
+    // The detail can carry a response body; it stays in the log, not the status.
+    yield* Effect.logWarning("OpenCode 2 model list failed", result.cause);
     return buildServerProvider({
       presentation: OPENCODE_2_PRESENTATION,
       enabled: true,
@@ -471,7 +472,7 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
         settings.customModels,
         DEFAULT_OPENCODE_MODEL_CAPABILITIES,
       ),
-      probe: probe("error", openCodeRuntimeErrorDetail(cause)),
+      probe: probe("error", "OpenCode could not load its model list."),
     });
   }
   const models = providerModelsFromSettings(
