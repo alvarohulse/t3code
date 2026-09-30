@@ -14,6 +14,7 @@ export const WINDOW_OPTIONS = [
   { days: 7, label: "7 days", command: "usage.period.week" },
   { days: 30, label: "30 days", command: "usage.period.month" },
   { days: 90, label: "90 days", command: "usage.period.quarter" },
+  { days: "monthToDate", label: "Month to date", command: "usage.period.monthToDate" },
 ] as const;
 
 /** Resolves page shortcuts without taking letters from fields or popup controls. */

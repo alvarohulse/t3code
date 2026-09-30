@@ -201,12 +201,15 @@ export function formatRelativeHourShort(
   return formatDateTimeShort(hourStart, timeZone);
 }
 
+/** A rolling number of days, or the calendar month so far in the viewer's zone. */
+export type UsageWindowDays = number | "monthToDate";
+
 /**
  * The window the page requests, expressed in the viewer's own time zone so days
  * line up with what they actually experienced.
  */
 export function makeWindow(
-  days: number,
+  days: UsageWindowDays,
   now = new Date(),
   resolution: UsageResolution = "day",
 ): UsageSummaryInput {
@@ -253,7 +256,8 @@ export function makeWindow(
   const [year = 0, month = 1, dayOfMonth = 1] = untilDay
     .split("-")
     .map((part) => Number.parseInt(part, 10));
-  const start = new Date(Date.UTC(year, month - 1, dayOfMonth - (days - 1)));
+  const length = days === "monthToDate" ? dayOfMonth : days;
+  const start = new Date(Date.UTC(year, month - 1, dayOfMonth - (length - 1)));
   return {
     sinceDay: UsageDay.make(start.toISOString().slice(0, 10)),
     untilDay: UsageDay.make(untilDay),
