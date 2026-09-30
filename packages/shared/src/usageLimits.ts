@@ -17,9 +17,11 @@ import {
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
   type UsageLimitSourceSnapshots,
+  UsageProviderKind,
 } from "@t3tools/contracts";
 
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -512,21 +514,26 @@ function poolSpend(members: readonly LimitPoolMember[]): ServerProviderUsageWind
   return { usedUsd, limitUsd };
 }
 
+const isUsageProviderKind = Schema.is(UsageProviderKind);
+
 /**
- * The first window per driver that the provider bills in dollars, pooled
- * across accounts. The Usage page shows it beside its own estimate, since a
- * provider's billing period rarely matches the page's date range.
+ * The first window per provider that it bills in dollars, pooled across
+ * accounts and keyed the way the Usage page keys its rows. The page shows it
+ * beside its own estimate, since a provider's billing period rarely matches
+ * the page's date range.
  */
-export function billedSpendByDriver(
+export function billedSpendByUsageProvider(
   pools: readonly LimitPool[],
-): ReadonlyMap<ServerProvider["driver"], LimitPoolWindow & { spend: object }> {
-  const billed = new Map<ServerProvider["driver"], LimitPoolWindow & { spend: object }>();
+): ReadonlyMap<UsageProviderKind, LimitPoolWindow & { spend: object }> {
+  const billed = new Map<UsageProviderKind, LimitPoolWindow & { spend: object }>();
   for (const pool of pools) {
+    const driver: string = pool.driver === "claudeAgent" ? "claude" : pool.driver;
+    if (!isUsageProviderKind(driver)) continue;
     const window = pool.windows.find(
       (candidate): candidate is LimitPoolWindow & { spend: object } =>
         candidate.spend !== undefined,
     );
-    if (window) billed.set(pool.driver, window);
+    if (window) billed.set(driver, window);
   }
   return billed;
 }

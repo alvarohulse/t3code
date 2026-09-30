@@ -19,7 +19,7 @@ import {
   collectExternalUsageLinks,
   collectLimitNotices,
   collectLimitPools,
-  billedSpendByDriver,
+  billedSpendByUsageProvider,
   displayLimitWindows,
   formatSpendLeft,
   elapsedShare,
@@ -730,12 +730,12 @@ describe("pooled account columns", () => {
       account("b", [{ ...credits, usedPercent: 25, spend: { usedUsd: 1000, limitUsd: 4000 } }]),
     ];
     const pools = collectLimitPools(billed, now);
-    const spend = billedSpendByDriver(pools).get(ProviderDriverKind.make("claudeAgent"))?.spend;
+    const spend = billedSpendByUsageProvider(pools).get("claude")?.spend;
     expect(spend).toEqual({ usedUsd: 4000, limitUsd: 10000 });
     expect(formatSpendLeft(spend!)).toBe("$6,000 left of $10,000");
 
     const partial = [...billed, account("c", [{ ...credits, usedPercent: 90 }])];
-    expect(billedSpendByDriver(collectLimitPools(partial, now)).size).toBe(0);
+    expect(billedSpendByUsageProvider(collectLimitPools(partial, now)).size).toBe(0);
   });
 
   it("preserves gaps without counting missing windows toward pooled quota", () => {

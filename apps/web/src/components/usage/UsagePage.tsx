@@ -1,6 +1,6 @@
 import { ChatGptUsageButton } from "../settings/ChatGptUsageButton";
 import {
-  billedSpendByDriver,
+  billedSpendByUsageProvider,
   collectLimitAccounts,
   collectLimitPools,
   formatResetsIn,
@@ -156,7 +156,7 @@ export function UsagePage() {
   // snapshots as the Limits tab; the estimate below covers the page's range.
   const billedSpend = useMemo(
     () =>
-      billedSpendByDriver(
+      billedSpendByUsageProvider(
         collectLimitPools(
           collectLimitAccounts(
             selectedEnvironmentIds === null
@@ -602,9 +602,7 @@ export function UsagePage() {
                       const totals = merged.providers.find((entry) => entry.provider === provider);
                       const share =
                         metric === "cost" ? (totals?.costShare ?? 0) : (totals?.tokenShare ?? 0);
-                      const billed = [...billedSpend].find(
-                        ([driver]) => driver === (provider === "claude" ? "claudeAgent" : provider),
-                      )?.[1];
+                      const billed = billedSpend.get(provider);
                       const billedResets = billed?.members[0]
                         ? formatResetsIn(billed.members[0].window, limitsNow)
                         : null;
