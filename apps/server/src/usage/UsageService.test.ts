@@ -285,11 +285,6 @@ describe("UsageService", () => {
           environment: { AGENT_CLI_CREDENTIAL_STORE: "memory" },
           authPath: ["config", "cursor", "auth.json"],
         },
-        {
-          platform: "linux" as const,
-          environment: { CURSOR_API_KEY: "different-account" },
-          authPath: ["config", "cursor", "auth.json"],
-        },
       ].entries()) {
         const authPath = NodePath.join(home, ...testCase.authPath);
         yield* Effect.promise(async () => {

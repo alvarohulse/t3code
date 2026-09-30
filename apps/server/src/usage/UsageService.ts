@@ -52,7 +52,7 @@ import { resolveAntigravityInstanceDirectories } from "../provider/antigravityAu
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 import { readOpenCodeUsage } from "./opencodeUsageReader.ts";
 import { readAntigravityUsage } from "./antigravityUsageReader.ts";
-import { readCursorAccountUsage } from "./cursorUsageReader.ts";
+import { readCursorAccountUsage, type CursorCredentialSource } from "./cursorUsageReader.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import { createOverrideRateTable, parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
@@ -608,14 +608,23 @@ export const make = Effect.gen(function* () {
         ? path.join(cursorUserHome, ".cursor", "auth.json")
         : path.join(cursorHome, platform === "win32" ? "Cursor" : "cursor", "auth.json");
     const credentialStore = hostEnvironment["AGENT_CLI_CREDENTIAL_STORE"];
-    const loginUnavailable =
-      Boolean(hostEnvironment["CURSOR_AUTH_TOKEN"]?.trim()) ||
-      Boolean(hostEnvironment["CURSOR_API_KEY"]?.trim()) ||
-      credentialStore === "memory";
+    const cursorAuthToken = hostEnvironment["CURSOR_AUTH_TOKEN"]?.trim();
+    const cursorApiKey = hostEnvironment["CURSOR_API_KEY"]?.trim();
+    // Match the CLI's precedence: an environment credential can name a
+    // different account from the saved login, so it wins.
+    const cursorCredential: CursorCredentialSource | null = cursorAuthToken
+      ? { kind: "accessToken", accessToken: cursorAuthToken }
+      : cursorApiKey
+        ? { kind: "apiKey", apiKey: cursorApiKey }
+        : credentialStore === "memory"
+          ? null
+          : platform === "darwin" && credentialStore !== "file"
+            ? { kind: "keychain" }
+            : cursorAuthPath;
     if (
-      platform === "darwin" &&
-      credentialStore !== "file" &&
-      !loginUnavailable &&
+      cursorCredential !== null &&
+      typeof cursorCredential !== "string" &&
+      cursorCredential.kind === "keychain" &&
       !settings.cursorKeychainUsageEnabled
     ) {
       scanned.push({
@@ -629,22 +638,17 @@ export const make = Effect.gen(function* () {
       return scanned;
     }
     const cursorUntilMs = yield* Clock.currentTimeMillis;
-    const account = loginUnavailable
-      ? {
-          accountKey: null,
-          records: [],
-          missing: true,
-          error: "Cursor account history needs a Cursor CLI login on this server.",
-        }
-      : yield* Effect.promise(() =>
-          readCursorAccountUsage(
-            platform === "darwin" && credentialStore !== "file"
-              ? { kind: "keychain" }
-              : cursorAuthPath,
-            windowStartMs,
-            cursorUntilMs,
-          ),
-        );
+    const account =
+      cursorCredential === null
+        ? {
+            accountKey: null,
+            records: [],
+            missing: true,
+            error: "Cursor account history needs a Cursor CLI login on this server.",
+          }
+        : yield* Effect.promise(() =>
+            readCursorAccountUsage(cursorCredential, windowStartMs, cursorUntilMs),
+          );
     // No saved login means there is no account source to report, not a setup error.
     if (account.missing && account.error === null) return scanned;
     if (account.accountKey !== null && account.error === null && !account.missing) {
