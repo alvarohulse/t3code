@@ -592,14 +592,20 @@ export const make = Effect.gen(function* () {
         ...(failed ? { message: "Some Antigravity history could not be read." } : {}),
       });
     }
+    // The same environment the default Cursor instance gives its CLI, so usage
+    // reads the credential the user configured for Cursor, not another one.
+    const cursorEnvironment = mergeProviderInstanceEnvironment(
+      settings.providerInstances[ProviderInstanceId.make("cursor")]?.environment,
+      hostEnvironment,
+    );
     const cursorUserHome =
-      (platform === "win32" ? hostEnvironment["USERPROFILE"] : hostEnvironment["HOME"]) || home;
-    const configHome = hostEnvironment["XDG_CONFIG_HOME"]?.trim();
+      (platform === "win32" ? cursorEnvironment["USERPROFILE"] : cursorEnvironment["HOME"]) || home;
+    const configHome = cursorEnvironment["XDG_CONFIG_HOME"]?.trim();
     const cursorHome =
       platform === "darwin"
         ? path.join(cursorUserHome, "Library", "Application Support")
         : platform === "win32"
-          ? hostEnvironment["APPDATA"] || path.join(cursorUserHome, "AppData", "Roaming")
+          ? cursorEnvironment["APPDATA"] || path.join(cursorUserHome, "AppData", "Roaming")
           : configHome && path.isAbsolute(configHome)
             ? configHome
             : path.join(cursorUserHome, ".config");
@@ -607,9 +613,9 @@ export const make = Effect.gen(function* () {
       platform === "darwin"
         ? path.join(cursorUserHome, ".cursor", "auth.json")
         : path.join(cursorHome, platform === "win32" ? "Cursor" : "cursor", "auth.json");
-    const credentialStore = hostEnvironment["AGENT_CLI_CREDENTIAL_STORE"];
-    const cursorAuthToken = hostEnvironment["CURSOR_AUTH_TOKEN"]?.trim();
-    const cursorApiKey = hostEnvironment["CURSOR_API_KEY"]?.trim();
+    const credentialStore = cursorEnvironment["AGENT_CLI_CREDENTIAL_STORE"];
+    const cursorAuthToken = cursorEnvironment["CURSOR_AUTH_TOKEN"]?.trim();
+    const cursorApiKey = cursorEnvironment["CURSOR_API_KEY"]?.trim();
     // Match the CLI's precedence: an environment credential can name a
     // different account from the saved login, so it wins.
     const cursorCredential: CursorCredentialSource | null = cursorAuthToken
