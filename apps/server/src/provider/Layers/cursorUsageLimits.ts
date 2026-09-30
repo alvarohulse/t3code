@@ -75,10 +75,25 @@ export const readCursorUsageLimits = Effect.fn("readCursorUsageLimits")(function
       environment.CURSOR_API_ENDPOINT?.trim() ||
       DEFAULT_CURSOR_API_ENDPOINT
     ).replace(/\/$/, "");
+    const client = yield* HttpClient.HttpClient;
     let token = environment.CURSOR_AUTH_TOKEN?.trim();
-    // An explicit API key can name a different account from the stored login.
-    if (!token && environment.CURSOR_API_KEY?.trim()) {
-      return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
+    const apiKey = environment.CURSOR_API_KEY?.trim();
+    // An explicit API key can name a different account from the stored login,
+    // so it is exchanged for its own account's token and the login is ignored.
+    if (!token && apiKey) {
+      const exchanged = yield* client
+        .execute(
+          HttpClientRequest.post(`${endpoint}/auth/exchange_user_api_key`).pipe(
+            HttpClientRequest.bearerToken(apiKey),
+            HttpClientRequest.bodyJsonUnsafe({}),
+          ),
+        )
+        .pipe(
+          Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(CursorCredentials)),
+        );
+      token = exchanged.accessToken?.trim();
+      if (!token) return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
     }
     const credentialStore = environment.AGENT_CLI_CREDENTIAL_STORE;
     if (!token && credentialStore === "memory") {
@@ -123,7 +138,6 @@ export const readCursorUsageLimits = Effect.fn("readCursorUsageLimits")(function
       token = credentials.accessToken?.trim();
     }
     if (!token) return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
-    const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(
       HttpClientRequest.post(`${endpoint}/aiserver.v1.DashboardService/GetCurrentPeriodUsage`).pipe(
         HttpClientRequest.bearerToken(token),

@@ -1199,15 +1199,60 @@ describe("Cursor usage limits", () => {
     });
   });
 
-  it("does not use a stored login for an explicit API key", async () => {
+  it("reads limits for the account an explicit API key names, not the stored login", async () => {
+    const urls: string[] = [];
     const limits = await runNode(
       readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_API_KEY: "different-account" }).pipe(
         Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.makeNoop({
+            readFileString: () => Effect.die("must not read the stored login"),
+          }),
+        ),
+        Effect.provideService(
           HttpClient.HttpClient,
-          HttpClient.make(() => Effect.die("must not request usage")),
+          HttpClient.make((request) => {
+            urls.push(request.url);
+            if (request.url.endsWith("/auth/exchange_user_api_key")) {
+              expect(request.headers.authorization).toBe("Bearer different-account");
+              return Effect.succeed(
+                HttpClientResponse.fromWeb(request, Response.json({ accessToken: "key-token" })),
+              );
+            }
+            expect(request.headers.authorization).toBe("Bearer key-token");
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({ planUsage: { totalPercentUsed: 73 } }),
+              ),
+            );
+          }),
         ),
       ),
     );
-    expect(limits.unavailable?.reason).toBe("unsupported");
+    expect(limits.windows[0]?.usedPercent).toBe(73);
+    expect(urls).toEqual([
+      "https://api2.cursor.sh/auth/exchange_user_api_key",
+      "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+    ]);
+  });
+
+  it("reports a rejected API key without exposing it", async () => {
+    const limits = await runNode(
+      readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_API_KEY: "revoked-key" }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response("revoked-key", { status: 401 })),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(limits.unavailable).toEqual({
+      reason: "probeFailed",
+      message: "Cursor could not read usage limits.",
+    });
   });
 });
