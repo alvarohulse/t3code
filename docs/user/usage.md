@@ -8,7 +8,9 @@ desktop when the terminal is not focused. Customize `usage.open` in
 
 **Usage** combines Codex, Claude Code, Grok Build, OpenCode, Antigravity, and Cursor history from your connected
 environments. It shows token use, cache savings, model breakdowns, and estimated API-equivalent
-cost. These estimates are not your subscription bill.
+cost. These estimates are not your subscription bill. When a provider bills you in dollars, such
+as a Cursor team spend limit or Claude usage credits, its row also shows what the provider has
+billed for its own billing period, which may not match the selected date range.
 
 Totals depend on the history available on each server. Grok turns without a saved completed-turn
 record are missing from the totals.
@@ -101,6 +103,10 @@ its monthly allowance, including separate Auto and API usage, using `CURSOR_AUTH
 `CURSOR_API_KEY`, or the CLI login. On macOS, this includes the default Keychain login after you enable Cursor
 usage. Keychain login is used for limits only with Cursor's default API endpoint. If you configure
 a custom Cursor endpoint, use an explicit token or file-based CLI login for limits.
+
+Metered accounts show their dollar budget as a Limits bar. On Cursor team plans billed per use, that
+is your own spend against your per-user limit for the billing cycle. On Claude, it is usage credits
+against the monthly limit; Claude does not report when that period resets.
 
 Grok reports the remaining subscription allowance and reset time for its current billing period
 after signing in with `grok login`. Explicit `XAI_API_KEY` connections and custom authentication
