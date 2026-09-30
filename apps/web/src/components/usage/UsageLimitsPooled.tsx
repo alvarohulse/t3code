@@ -11,6 +11,8 @@ import {
   type LimitPool,
   type LimitPoolMember,
   type LimitPoolWindow,
+  formatSpendLeft,
+  formatSpendUsed,
   remainingPercent,
 } from "@t3tools/shared/usageLimits";
 import { AlertTriangleIcon, ExternalLinkIcon, TicketIcon } from "lucide-react";
@@ -187,6 +189,7 @@ function SegmentPopover({
       </div>
       <div className="flex flex-col gap-1 border-t border-border/60 pt-2.5">
         <Row label="Left">{remaining}%</Row>
+        {window.spend ? <Row label="Billed">{formatSpendUsed(window.spend)}</Row> : null}
         {window.resetsAt ? (
           <Row label="Resets">
             {formatUpcomingTimestamp(window.resetsAt, timestampFormat, now)}
@@ -514,6 +517,11 @@ function PoolWindowCard({
           <span className="text-sm text-muted-foreground">left</span>
           {pool.pace ? <PaceIcon pace={pool.pace} /> : null}
         </span>
+        {pool.spend ? (
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {formatSpendLeft(pool.spend)}
+          </span>
+        ) : null}
         {nextRefill && pool.columns.length > 1 ? (
           <span className="text-xs font-medium text-foreground tabular-nums">
             ↻ +{nextRefill.restoresPercent}%
