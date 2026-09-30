@@ -24,6 +24,17 @@ export const ServerProviderUsageWindow = Schema.Struct({
   usedPercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
   resetsAt: Schema.optional(IsoDateTime),
   windowDurationMins: Schema.optional(NonNegativeInt),
+  /**
+   * The dollar budget behind a metered window, as the provider bills it
+   * (Cursor's spend limit, Claude's usage credits). `usedPercent` stays the
+   * share of `limitUsd`, so clients that ignore this still draw the bar.
+   */
+  spend: Schema.optional(
+    Schema.Struct({
+      usedUsd: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+      limitUsd: Schema.Number.check(Schema.isGreaterThan(0)),
+    }),
+  ),
 });
 export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 

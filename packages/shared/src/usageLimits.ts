@@ -363,6 +363,8 @@ export interface LimitPoolWindow {
   }>;
   readonly remainingPercent: number;
   readonly usedPercent: number;
+  /** Summed dollars, only when every member reports them; a partial sum would understate the pool. */
+  readonly spend: ServerProviderUsageWindow["spend"];
   readonly pace: LimitPace | null;
   readonly resets: ReadonlyArray<{
     readonly member: LimitPoolMember;
@@ -491,11 +493,42 @@ function poolWindows(accounts: readonly LimitAccount[], now: number): readonly L
       ),
       usedPercent: Math.round(usedPercent),
       remainingPercent: Math.round(100 - usedPercent),
+      spend: poolSpend(members),
       pace: meanElapsed === null ? null : paceOfShares(timedUsed, meanElapsed),
       resets,
     };
   });
   return pools.sort((left, right) => WINDOW_KIND_ORDER[left.kind] - WINDOW_KIND_ORDER[right.kind]);
+}
+
+function poolSpend(members: readonly LimitPoolMember[]): ServerProviderUsageWindow["spend"] {
+  let usedUsd = 0;
+  let limitUsd = 0;
+  for (const { window } of members) {
+    if (!window.spend) return undefined;
+    usedUsd += window.spend.usedUsd;
+    limitUsd += window.spend.limitUsd;
+  }
+  return { usedUsd, limitUsd };
+}
+
+/**
+ * The first window per driver that the provider bills in dollars, pooled
+ * across accounts. The Usage page shows it beside its own estimate, since a
+ * provider's billing period rarely matches the page's date range.
+ */
+export function billedSpendByDriver(
+  pools: readonly LimitPool[],
+): ReadonlyMap<ServerProvider["driver"], LimitPoolWindow & { spend: object }> {
+  const billed = new Map<ServerProvider["driver"], LimitPoolWindow & { spend: object }>();
+  for (const pool of pools) {
+    const window = pool.windows.find(
+      (candidate): candidate is LimitPoolWindow & { spend: object } =>
+        candidate.spend !== undefined,
+    );
+    if (window) billed.set(pool.driver, window);
+  }
+  return billed;
 }
 
 /** The one-line status under a provider heading when there are no bars to draw. */
@@ -507,6 +540,22 @@ export function limitsNotice(limits: ServerProviderUsageLimits): string | null {
     return limits.unavailable.message ?? "Could not read limits.";
   }
   return limits.windows.length === 0 ? "No limits reported." : null;
+}
+
+const WHOLE_USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 0,
+});
+
+/** `$1,124 left of $5,000`: what remains of a metered window's dollar budget. */
+export function formatSpendLeft(spend: NonNullable<ServerProviderUsageWindow["spend"]>): string {
+  return `${WHOLE_USD.format(Math.max(0, spend.limitUsd - spend.usedUsd))} left of ${WHOLE_USD.format(spend.limitUsd)}`;
+}
+
+/** `$3,876 of $5,000`: what a metered window has billed so far. */
+export function formatSpendUsed(spend: NonNullable<ServerProviderUsageWindow["spend"]>): string {
+  return `${WHOLE_USD.format(spend.usedUsd)} of ${WHOLE_USD.format(spend.limitUsd)}`;
 }
 
 /** Quota left in the window, 0..100. Bars and labels show what remains, as Codex does. */
