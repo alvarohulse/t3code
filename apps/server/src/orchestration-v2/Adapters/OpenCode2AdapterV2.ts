@@ -3,21 +3,24 @@
  * instance's `opencode serve` process through the HTTP client and reads that
  * server's `/api/event` stream, routed here by session id.
  *
- * A turn is one `session.prompt`; the session's next `session.execution.*`
- * terminal ends it. Approvals, questions, subagents, steering, fork, rollback
- * and compaction arrive in later layers: sessions run in Full access only,
- * with the `subagent` tool denied, the capabilities below say no, and a
- * permission or form that still reaches a session is answered so the turn
- * cannot hang.
+ * A turn is one `session.prompt` (or `session.command`, or `session.compact`
+ * for `/compact`); the session's next `session.execution.*` terminal ends it.
+ * Plan mode is OpenCode's `plan` agent, switched before the prompt like the
+ * model. Approvals, questions, subagents, steering, fork and rollback arrive
+ * in later layers: sessions run in Full access only, with the `subagent` tool
+ * denied, the capabilities below say no, and a permission or form that still
+ * reaches a session is answered so the turn cannot hang.
  *
  * @module orchestration-v2/Adapters/OpenCode2AdapterV2
  */
 import {
   AbsolutePath,
+  Agent,
   Location,
   Model,
   Provider,
   Session,
+  Skill,
   type OpenCodeEvent,
 } from "@opencode/client/effect";
 import type {
@@ -47,6 +50,7 @@ import {
   type OpenCodeRuntimeError,
 } from "../../provider/opencodeRuntime.ts";
 import { buildRuntimeInstructions } from "../../provider/RuntimeInstructions.ts";
+import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { providerMessageTextWithAttachmentPaths } from "../AttachmentPrompt.ts";
@@ -192,6 +196,9 @@ interface ActiveTurn {
   };
   steps: number;
   lastStep: Tokens | undefined;
+  /** The compaction running in this turn, `/compact` or OpenCode's own when the context fills. */
+  compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
+  compactions: number;
   interrupted: boolean;
   /**
    * Set on a turn started after a timed-out Stop's run left the server: that
@@ -214,6 +221,8 @@ interface ThreadState {
   active: ActiveTurn | undefined;
   /** What the native session runs now, so a changed selection is switched before prompting. */
   model: ModelRef | undefined;
+  /** The session's agent (`build`, `plan`, ...), undefined when OpenCode's default is in use. */
+  agent: string | undefined;
   /**
    * Set when a turn ended here while OpenCode may still be running it: a Stop
    * that timed out, or a prompt whose request failed without a clear answer.
@@ -281,12 +290,16 @@ export const OPENCODE_2_FULL_ACCESS_ONLY =
 const QUESTION_REPLY = "Questions aren't supported by this OpenCode integration yet.";
 
 const INTERRUPT_TIMEOUT = "10 seconds";
+/** How long a turn waits on the directory's commands or skills before sending the text as is. */
+const INVENTORY_TIMEOUT = "5 seconds";
 const ACTIVE_CHECK_TIMEOUT = "5 seconds";
 /** Answers that mean the server refused a prompt; any other failure may have been accepted. */
 const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
   "InvalidRequestError",
   "ConflictError",
   "UnauthorizedError",
+  "CommandNotFoundError",
+  "SkillNotFoundError",
 ]);
 
 export const OPENCODE_2_STILL_STOPPING =
@@ -328,6 +341,28 @@ const sameModel = (left: ModelRef, right: ModelRef | undefined) =>
   left.providerID === right?.providerID &&
   left.id === right?.id &&
   (left.variant ?? "default") === (right?.variant ?? "default");
+
+/** OpenCode's own agents for T3's interaction modes; plan mode is its read-only `plan` agent. */
+const agentFor = (input: ProviderAdapterV2TurnInput) =>
+  input.runtimePolicy.interactionMode === "plan" ? "plan" : "build";
+
+/** `/name args` naming one of the workspace's commands, which OpenCode expands itself. */
+const commandOf = (text: string) => {
+  const match = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
+  return match === null ? undefined : { name: match[1]!, text: match[2] ?? "" };
+};
+
+/** Whether a prompt names any skill at all, before the directory's skills are read. */
+const SKILL_MENTION = new RegExp(SKILL_MENTION_PATTERN.source, "u");
+
+/** The workspace skills a prompt names with the composer's `$skill` tokens. */
+const skillsNamed = (text: string, known: ReadonlySet<string>) => [
+  ...new Set(
+    [...text.matchAll(SKILL_MENTION_PATTERN)].flatMap((match) =>
+      known.has(match[2] ?? "") ? [match[2]!] : [],
+    ),
+  ),
+];
 
 /** The turn's own tokens: steps add up, and the last step's input is the live context size. */
 const turnTokenUsage = (turn: ActiveTurn, status: OrchestrationV2ProviderTurn["status"]) =>
@@ -554,6 +589,40 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       });
     });
 
+    /** The turn's compaction item; its summary is the text OpenCode carries forward. */
+    const emitCompaction = Effect.fnUntraced(function* (
+      state: ThreadState,
+      turn: ActiveTurn,
+      status: "running" | "completed" | "failed" | "interrupted",
+      summary?: string,
+    ) {
+      const compaction = turn.compaction;
+      if (compaction === undefined) return;
+      const updatedAt = yield* DateTime.now;
+      const completedAt = status === "running" ? null : updatedAt;
+      yield* emit({
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          ...itemBase(
+            state,
+            turn,
+            compaction.nativeId,
+            status,
+            compaction.startedAt,
+            completedAt,
+            updatedAt,
+          ),
+          nodeId: turn.input.rootNodeId,
+          type: "compaction",
+          driver,
+          title: status === "running" ? "Compacting context" : "Context compacted",
+          ...(summary === undefined || summary.length === 0 ? {} : { summary }),
+        },
+      });
+      if (status !== "running") turn.compaction = undefined;
+    });
+
     const emitProviderTurn = (
       state: ThreadState,
       turn: ActiveTurn,
@@ -591,6 +660,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           terminal.status === "completed" ? "completed" : "interrupted",
         );
       }
+      yield* emitCompaction(state, turn, terminal.status === "failed" ? "failed" : "interrupted");
       const window = contextWindows.get(turn.input.modelSelection.model);
       const lastStep = turn.lastStep;
       yield* emitProviderTurn(state, turn, {
@@ -793,6 +863,18 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           turn.tools.delete(event.data.id);
           return;
         }
+        // `/compact` and OpenCode's own compaction when the context fills
+        // (`reason: "auto"`) both run inside a turn's execution.
+        case "session.compaction.started":
+          turn.compaction = {
+            nativeId: `${turn.providerTurn.id}:compaction:${turn.compactions++}`,
+            startedAt: yield* DateTime.now,
+          };
+          return yield* emitCompaction(state, turn, "running");
+        case "session.compaction.ended":
+          return yield* emitCompaction(state, turn, "completed", event.data.text);
+        case "session.compaction.failed":
+          return yield* emitCompaction(state, turn, "failed");
         case "session.step.ended":
         case "session.step.failed": {
           const tokens = event.data.tokens;
@@ -889,25 +971,27 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const register = (
       providerThread: OrchestrationV2ProviderThread,
       sessionId: string,
-      model: ModelRef | undefined,
+      native: { readonly model?: ModelRef | undefined; readonly agent?: string | undefined },
     ) => {
       const existing = threads.get(sessionId);
       if (existing !== undefined) {
         existing.providerThread = providerThread;
-        existing.model = model;
+        existing.model = native.model;
+        existing.agent = native.agent;
         return providerThread;
       }
       threads.set(sessionId, {
         providerThread,
         providerTurns: new Map(),
         active: undefined,
-        model,
+        model: native.model,
+        agent: native.agent,
         unsettled: false,
       });
       return providerThread;
     };
 
-    const prompt = (turnInput: ProviderAdapterV2TurnInput) => {
+    const promptText = (turnInput: ProviderAdapterV2TurnInput) => {
       const text = providerMessageTextWithAttachmentPaths({
         text: turnInput.message.text,
         attachments: turnInput.message.attachments,
@@ -919,6 +1003,55 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       });
       return `${text}\n\n${instructions}`;
     };
+
+    /**
+     * What a turn sends: `/compact` compacts, `/name args` naming a workspace
+     * command runs it, and anything else is a prompt with the `$skill`s it
+     * names attached. Commands and skills are read from the session's
+     * directory only when the text could use them.
+     */
+    const submit = Effect.fnUntraced(function* (
+      sessionId: string,
+      turnInput: ProviderAdapterV2TurnInput,
+    ) {
+      const sessionID = Session.ID.make(sessionId);
+      const text = turnInput.message.text.trim();
+      const bare = turnInput.message.attachments.length === 0;
+      if (bare && text === "/compact") {
+        return yield* client.session.compact({ sessionID }).pipe(Effect.asVoid);
+      }
+      const location = { directory: turnInput.runtimePolicy.cwd ?? serverConfig.cwd };
+      const command = bare ? commandOf(text) : undefined;
+      if (command !== undefined) {
+        const commands = yield* client.command.list({ location }).pipe(
+          Effect.timeout(INVENTORY_TIMEOUT),
+          Effect.map((list) => list.data),
+          Effect.orElseSucceed(() => []),
+        );
+        if (commands.some((entry) => entry.name === command.name)) {
+          return yield* client.session.command({ sessionID, ...command });
+        }
+      }
+      const skills = SKILL_MENTION.test(text)
+        ? skillsNamed(
+            text,
+            yield* client.skill.list({ location }).pipe(
+              Effect.timeout(INVENTORY_TIMEOUT),
+              Effect.map((list) => new Set(list.data.map((skill) => skill.id))),
+              Effect.orElseSucceed(() => new Set<string>()),
+            ),
+          )
+        : [];
+      return yield* client.session
+        .prompt({
+          sessionID,
+          text: promptText(turnInput),
+          ...(skills.length === 0
+            ? {}
+            : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
+        })
+        .pipe(Effect.asVoid);
+    });
 
     const runtime: ProviderAdapterV2SessionRuntime = {
       instanceId,
@@ -974,7 +1107,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             status: "idle",
             updatedAt: createdAt,
           };
-          return register(providerThread, created.id, created.model);
+          return register(providerThread, created.id, created);
         }).pipe(
           Effect.mapError((cause) =>
             isProviderAdapterError(cause)
@@ -1016,7 +1149,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               updatedAt: yield* DateTime.now,
             },
             sessionId,
-            native.model,
+            native,
           );
         }).pipe(
           Effect.mapError((cause) =>
@@ -1030,6 +1163,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 }),
           ),
         ),
+      // `/compact` is its own turn, which `startTurn` sends as `session.compact`.
+      compactThread: (turnInput) =>
+        runtime.startTurn({ ...turnInput, message: { ...turnInput.message, text: "/compact" } }),
       startTurn: (turnInput) =>
         Effect.gen(function* () {
           const sessionId = yield* sessionIdOf(turnInput.providerThread);
@@ -1091,6 +1227,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               usage: { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0 },
               steps: 0,
               lastStep: undefined,
+              compaction: undefined,
+              compactions: 0,
               interrupted: false,
               awaitingStart: afterUnsettled,
             };
@@ -1146,47 +1284,54 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               }),
             });
           }
-          // A selection changed since the last turn applies now; OpenCode keeps
-          // the session's model otherwise.
+          // A selection or mode changed since the last turn applies now; OpenCode
+          // keeps the session's model and agent otherwise. Switching to or from
+          // `plan` queues OpenCode's own "Plan mode" reminder for the prompt.
+          const agent = agentFor(turnInput);
+          if (agent !== (state.agent ?? "build")) {
+            yield* client.session.switchAgent({
+              sessionID: Session.ID.make(sessionId),
+              agent: Agent.ID.make(agent),
+            });
+            state.agent = agent;
+          }
           if (!sameModel(model, state.model)) {
             yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
             state.model = model;
           }
           const turn = yield* begin;
-          yield* client.session
-            .prompt({ sessionID: Session.ID.make(sessionId), text: prompt(turnInput) })
-            .pipe(
-              // Deleted outside T3: the thread is broken, and forgetting it makes
-              // the next turn resume, fail, and recreate it with a handoff.
-              Effect.catchTags({
-                SessionNotFoundError: () =>
-                  finishTurn(
-                    state,
-                    {
+          yield* submit(sessionId, turnInput).pipe(
+            // Deleted outside T3: the thread is broken, and forgetting it makes
+            // the next turn resume, fail, and recreate it with a handoff.
+            Effect.catchTags({
+              SessionNotFoundError: () =>
+                finishTurn(
+                  state,
+                  {
+                    status: "failed",
+                    failure: makeProviderFailure({
+                      message:
+                        "The OpenCode session no longer exists. Send the message again to continue in a new session.",
+                      class: "provider_error",
+                    }),
+                  },
+                  "broken",
+                ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
+            }),
+            Effect.tapError((cause) =>
+              state.active === turn
+                ? Effect.gen(function* () {
+                    // Without a clear rejection the server may have taken the
+                    // prompt, so the next turn checks before it prompts again.
+                    if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) state.unsettled = true;
+                    yield* finishTurn(state, {
                       status: "failed",
-                      failure: makeProviderFailure({
-                        message:
-                          "The OpenCode session no longer exists. Send the message again to continue in a new session.",
-                        class: "provider_error",
-                      }),
-                    },
-                    "broken",
-                  ).pipe(Effect.andThen(Effect.sync(() => threads.delete(sessionId)))),
-              }),
-              Effect.tapError((cause) =>
-                state.active === turn
-                  ? Effect.gen(function* () {
-                      // Without a clear rejection the server may have taken the
-                      // prompt, so the next turn checks before it prompts again.
-                      if (!CLEAR_PROMPT_REJECTIONS.has(cause._tag)) state.unsettled = true;
-                      yield* finishTurn(state, {
-                        status: "failed",
-                        failure: makeProviderFailure({ cause, class: "provider_error" }),
-                      });
-                    })
-                  : Effect.void,
-              ),
-            );
+                      failure: makeProviderFailure({ cause, class: "provider_error" }),
+                    });
+                  })
+                : Effect.void,
+            ),
+          );
         }).pipe(
           Effect.mapError((cause) =>
             isProviderAdapterError(cause)

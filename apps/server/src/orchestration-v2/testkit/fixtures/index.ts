@@ -51,9 +51,15 @@ import { assertOpenCodeChildApprovalOutput } from "./opencode_child_approval/out
 import { openCodeRunningChildApprovalInput } from "./opencode_running_child_approval/input.ts";
 import { assertOpenCodeRunningChildApprovalOutput } from "./opencode_running_child_approval/output.ts";
 import { openCodeSubagentInput } from "./opencode_subagent/input.ts";
+import { openCode2CommandInput } from "./opencode2_command/input.ts";
+import { assertOpenCode2CommandOutput } from "./opencode2_command/output.ts";
+import { openCode2CompactionInput } from "./opencode2_compaction/input.ts";
+import { assertOpenCode2CompactionOutput } from "./opencode2_compaction/output.ts";
 import { openCode2InterruptInput } from "./opencode2_interrupt/input.ts";
 import { assertOpenCode2InterruptOutput } from "./opencode2_interrupt/output.ts";
 import { openCode2SimpleInput } from "./opencode2_simple/input.ts";
+import { openCode2SkillInput } from "./opencode2_skill/input.ts";
+import { assertOpenCode2SkillOutput } from "./opencode2_skill/output.ts";
 import { assertOpenCode2SimpleOutput } from "./opencode2_simple/output.ts";
 import { openCode2ToolCallInput } from "./opencode2_tool_call/input.ts";
 import { assertOpenCode2ToolCallOutput } from "./opencode2_tool_call/output.ts";
@@ -784,6 +790,45 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
       },
     ],
   },
+  {
+    name: "opencode2_compaction",
+    buildInput: openCode2CompactionInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("opencode"),
+        transcriptFile: new URL(
+          "./opencode2_compaction/opencode_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: {
+          instanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+          model: "opencode/big-pickle",
+        },
+        assertOutput: assertOpenCode2CompactionOutput,
+      },
+    ],
+  },
+  // Recorded live against 2.0.18 on OpenRouter with the workspace's own command and skill.
+  ...(
+    [
+      ["opencode2_command", openCode2CommandInput, assertOpenCode2CommandOutput],
+      ["opencode2_skill", openCode2SkillInput, assertOpenCode2SkillOutput],
+    ] as const
+  ).map(([name, buildInput, assertOutput]) => ({
+    name,
+    buildInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("opencode"),
+        transcriptFile: new URL(`./${name}/opencode_transcript.ndjson`, import.meta.url),
+        modelSelection: {
+          instanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+          model: "openrouter/deepseek/deepseek-v4-flash",
+        },
+        assertOutput,
+      },
+    ],
+  })),
   {
     name: "opencode_child_approval",
     buildInput: openCodeChildApprovalInput,

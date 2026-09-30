@@ -7,7 +7,8 @@
  *   OPENCODE2_BIN=/path/to/opencode vp test run src/orchestration-v2/OpenCode2OrchestratorV2.live.test.ts
  *
  * The server runs with isolated HOME and XDG directories on the free
- * `opencode/big-pickle` model; `OPENCODE2_MODEL` picks another.
+ * `opencode/big-pickle` model; `OPENCODE2_MODEL` picks another. A second run
+ * covers plan mode, a workspace command and skill, and `/compact`.
  */
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { SourceControlProviderRegistry } from "../sourceControl/SourceControlProviderRegistry.ts";
@@ -196,7 +197,10 @@ const send = Effect.fn("OpenCode2Live.send")(function* (
 });
 
 const AssistantModel = Schema.fromJsonString(
-  Schema.Struct({ model: Schema.Struct({ providerID: Schema.String, id: Schema.String }) }),
+  Schema.Struct({
+    model: Schema.Struct({ providerID: Schema.String, id: Schema.String }),
+    agent: Schema.optional(Schema.String),
+  }),
 );
 const decodeAssistantModel = Schema.decodeUnknownSync(AssistantModel);
 
@@ -215,6 +219,22 @@ const assistantModels = (nativeSessionId: string) =>
         .all(nativeSessionId)
         .map((row) => decodeAssistantModel(row.data).model)
         .map((model) => `${model.providerID}/${model.id}`);
+    } finally {
+      db.close();
+    }
+  });
+
+/** The agent that wrote each assistant message in a native session, oldest first. */
+const assistantAgents = (nativeSessionId: string) =>
+  Effect.sync(() => {
+    const db = new NodeSqlite.DatabaseSync(`${ROOT}/data/opencode/opencode.db`, { readOnly: true });
+    try {
+      return db
+        .prepare(
+          "SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY seq",
+        )
+        .all(nativeSessionId)
+        .map((row) => decodeAssistantModel(row.data).agent);
     } finally {
       db.close();
     }
@@ -334,6 +354,106 @@ describe.runIf(binaryPath !== undefined && ROOT !== "")("OpenCode 2 live orchest
         );
         assert.equal(refused.runs.at(-1)?.status, "failed");
         assert.isFalse(yield* fs.exists(path.join(ROOT, "work", "supervised.txt")));
+      }).pipe(Effect.provide(Layer.merge(liveLayer, NodeServices.layer)), Effect.scoped),
+    360_000,
+  );
+
+  it.live(
+    "runs plan mode, a workspace command and skill, and /compact through the real driver",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const work = path.join(ROOT, "work");
+        yield* fs.makeDirectory(path.join(work, ".opencode", "command"), { recursive: true });
+        yield* fs.makeDirectory(path.join(work, ".opencode", "skills", "greet"), {
+          recursive: true,
+        });
+        yield* fs.writeFileString(
+          path.join(work, ".opencode", "command", "hello.md"),
+          "---\ndescription: Say hello to the workspace\n---\nReply with exactly: HELLO $ARGUMENTS\n",
+        );
+        yield* fs.writeFileString(
+          path.join(work, ".opencode", "skills", "greet", "SKILL.md"),
+          "---\nname: greet\ndescription: Greets the user with the secret word MANGO.\n---\nWhen this skill is active, begin your reply with the exact word MANGO.\n",
+        );
+        yield* runEffectWorkerDaemonWithOptions({ concurrency: 2 }).pipe(Effect.forkScoped);
+
+        // The workspace's own command and skill reach the composer's pickers.
+        const instance = yield* (yield* ProviderInstanceRegistry).getInstance(INSTANCE);
+        assert.isDefined(instance);
+        const workspace = yield* instance!.snapshotForCwd!(work);
+        assert.include(
+          workspace.skills.map((skill) => skill.name),
+          "greet",
+        );
+        assert.includeMembers(
+          workspace.slashCommands.map((command) => command.name),
+          ["compact", "hello"],
+        );
+
+        const orchestrator = yield* OrchestratorV2;
+        const threadId = ThreadId.make("thread:opencode2-live-modes");
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("command:opencode2-live-modes:create"),
+          threadId,
+          projectId: ProjectId.make("project:opencode2-live-modes"),
+          title: "OpenCode 2 live modes",
+          modelSelection: MODEL,
+          runtimeMode: "full-access",
+          interactionMode: "plan",
+          branch: null,
+          worktreePath: work,
+        });
+        const runs = (count: number) => (projection: OrchestrationV2ThreadProjection) =>
+          projection.runs.length === count && settled(projection);
+        const lastReply = (projection: OrchestrationV2ThreadProjection) =>
+          projection.turnItems.findLast((item) => item.type === "assistant_message");
+
+        // Plan mode is OpenCode's plan agent: it plans instead of editing.
+        yield* send(
+          threadId,
+          "modes-plan",
+          "Plan how to add a --verbose flag to a script named cli.js. Present a short plan; do not implement it.",
+        );
+        const planned = yield* waitFor(threadId, runs(1));
+        assert.equal(planned.runs[0]?.status, "completed");
+        const sessionId = planned.providerThreads[0]?.nativeThreadRef?.nativeId;
+        assert.isDefined(sessionId);
+        const planSteps = yield* assistantAgents(sessionId!);
+        assert.isAbove(planSteps.length, 0);
+        assert.isTrue(planSteps.every((agent) => agent === "plan"));
+
+        yield* orchestrator.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("command:opencode2-live-modes:default"),
+          threadId,
+          interactionMode: "default",
+        });
+        yield* send(threadId, "modes-command", "/hello WORLD");
+        const commanded = yield* waitFor(threadId, runs(2));
+        assert.equal(commanded.runs[1]?.status, "completed");
+        assert.include(lastReply(commanded)?.text ?? "", "HELLO WORLD");
+        assert.equal((yield* assistantAgents(sessionId!)).at(-1), "build");
+
+        yield* send(threadId, "modes-skill", "Use $greet to say hi in three words.");
+        const skilled = yield* waitFor(threadId, runs(3));
+        assert.equal(skilled.runs[2]?.status, "completed");
+        assert.include(lastReply(skilled)?.text ?? "", "MANGO");
+
+        yield* send(threadId, "modes-compact", "/compact");
+        const compacted = yield* waitFor(threadId, runs(4));
+        assert.equal(compacted.runs[3]?.status, "completed");
+        const compaction = compacted.turnItems.find((item) => item.type === "compaction");
+        assert.equal(compaction?.status, "completed");
+        assert.equal(compaction?.runId, compacted.runs[3]?.id);
+        assert.isAbove(
+          compaction?.type === "compaction" ? (compaction.summary ?? "").length : 0,
+          0,
+        );
       }).pipe(Effect.provide(Layer.merge(liveLayer, NodeServices.layer)), Effect.scoped),
     360_000,
   );

@@ -71,6 +71,10 @@ export const OPENCODE2_TOOL_CALL_PROMPT =
   "Use the read tool to read hello.txt, then run the shell command `echo TOOL_OK` with the bash tool, then reply DONE.";
 export const OPENCODE2_INTERRUPT_PROMPT =
   "Run the shell command `sleep 60 && echo LATE` with the bash tool, then reply DONE.";
+export const OPENCODE2_COMPACTION_FIRST_PROMPT = "Remember the codeword PAPAYA. Reply OK.";
+export const OPENCODE2_COMPACTION_RECALL_PROMPT = "What was the codeword? One word.";
+export const OPENCODE2_COMMAND_PROMPT = "/hello WORLD";
+export const OPENCODE2_SKILL_PROMPT = "Use $greet to say hi in three words.";
 export const TURN_INTERRUPT_PROMPT =
   "Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally.";
 export const TURN_INTERRUPT_MID_TOOL_PROMPT =
