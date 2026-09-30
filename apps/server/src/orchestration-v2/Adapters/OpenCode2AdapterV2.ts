@@ -206,6 +206,13 @@ interface ActiveTurn {
    * answer, or its inbox item for a command. A reconnect backfills from here.
    */
   promptId: string | undefined;
+  /**
+   * The session's newest history item before the turn started, or null when
+   * the history was empty. A `session.command` answers without the id of the
+   * item it queues, so a stream lost before its inbox event leaves only this
+   * to backfill from: everything after it is the turn's.
+   */
+  before: string | null | undefined;
   /** The compaction running in this turn, `/compact` or OpenCode's own when the context fills. */
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -1013,13 +1020,16 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
      */
     const backfill = Effect.fnUntraced(function* (sessionId: string, state: ThreadState) {
       const turn = state.active;
-      if (turn?.promptId === undefined) return undefined;
-      const promptId = turn.promptId;
+      if (turn === undefined) return undefined;
+      const { promptId, before } = turn;
+      if (promptId === undefined && before === undefined) return undefined;
       const recent = yield* paginate(
         { sessionID: Session.ID.make(sessionId), order: "desc" as const, limit: 50 },
         client.message.list,
       ).pipe(
-        Stream.takeUntil((message) => message.id === promptId),
+        promptId === undefined
+          ? Stream.takeWhile((message) => message.id !== before)
+          : Stream.takeUntil((message) => message.id === promptId),
         Stream.runCollect,
       );
       const idle = recent.find((message) => message.type === "idle");
@@ -1121,6 +1131,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     );
 
     let currentScope = initial.scope;
+    // The borrow in use when the session closes is returned with it, so a
+    // spawned server can still reach its idle shutdown.
+    yield* Effect.addFinalizer(() => Scope.close(currentScope, Exit.void));
     const follow = (stream: Stream.Stream<OpenCode2StreamEvent, unknown>): Effect.Effect<void> =>
       stream.pipe(
         Stream.runForEach(handleEvent),
@@ -1297,6 +1310,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       ),
     );
 
+    const markBefore = (sessionId: string, before: string | null) =>
+      Effect.sync(() => {
+        const turn = threads.get(sessionId)?.active;
+        if (turn !== undefined) turn.before = before;
+      });
+
     /**
      * What a turn sends: `/compact` compacts, `/name args` naming a workspace
      * command runs it, and anything else is a prompt with the `$skill`s it
@@ -1322,6 +1341,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           Effect.orElseSucceed(() => []),
         );
         if (commands.some((entry) => entry.name === command.name)) {
+          // The command's own inbox item has no id in the answer, so the turn
+          // remembers where the history stood before it.
+          const newest = yield* client.message.list({ sessionID, order: "desc", limit: 1 });
+          yield* markBefore(sessionId, newest.data[0]?.id ?? null);
           yield* client.session.command({ sessionID, ...command });
           return undefined;
         }
@@ -1534,6 +1557,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               steps: 0,
               lastStep: undefined,
               promptId: undefined,
+              before: undefined,
               compaction: undefined,
               compactions: 0,
               interrupted: false,
