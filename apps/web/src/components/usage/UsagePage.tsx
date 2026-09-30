@@ -6,7 +6,9 @@ import {
   ProviderDriverKind,
   USAGE_CONTRACT_VERSION,
   type EnvironmentId,
+  type UsageDay,
   type UsageProviderKind,
+  type UsageSummaryInput,
 } from "@t3tools/contracts";
 import {
   CircleAlertIcon,
@@ -75,6 +77,7 @@ import {
 } from "../WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import { UsageLimitsSection } from "./UsageLimits";
 import { UsagePriceOverrides } from "./UsagePriceOverrides";
 import { UsageProviderChart } from "./UsageProviderChart";
@@ -113,7 +116,12 @@ export function UsagePage() {
     });
     return shortcut ? `${option.label} (${shortcut})` : option.label;
   };
-  const [windowSelection, setWindowSelection] = useState(() => ({
+  // "custom" is a date-picker range; it is not saved, so reopening Usage
+  // returns to the last preset.
+  const [windowSelection, setWindowSelection] = useState<{
+    days: UsagePagePreferences["windowDays"] | "custom";
+    window: UsageSummaryInput;
+  }>(() => ({
     days: preferences.windowDays,
     window: makeWindow(
       preferences.windowDays,
@@ -204,9 +212,12 @@ export function UsagePage() {
       window: makeWindow(days, undefined, days === 1 ? "hour" : "day"),
     });
   };
+  const selectRange = (sinceDay: UsageDay, untilDay: UsageDay) => {
+    setWindowSelection({ days: "custom", window: { ...makeWindow(1), sinceDay, untilDay } });
+  };
   const selectMetric = (nextMetric: UsageMetric) => {
     if (nextMetric === "limits") setLimitsNow(Date.now());
-    const nextPreferences = { metric: nextMetric, windowDays };
+    const nextPreferences = { metric: nextMetric, windowDays: preferences.windowDays };
     setPreferences(nextPreferences);
     saveUsagePagePreferences(nextPreferences);
   };
@@ -267,12 +278,16 @@ export function UsagePage() {
       });
       return;
     }
-    const nextWindow = makeWindow(windowDays, undefined, isPast24Hours ? "hour" : "day");
+    const nextWindow =
+      windowDays === "custom"
+        ? window
+        : makeWindow(windowDays, undefined, isPast24Hours ? "hour" : "day");
     if (
-      nextWindow.sinceDay !== window.sinceDay ||
-      nextWindow.untilDay !== window.untilDay ||
-      nextWindow.sinceTime !== window.sinceTime ||
-      nextWindow.untilTime !== window.untilTime
+      windowDays !== "custom" &&
+      (nextWindow.sinceDay !== window.sinceDay ||
+        nextWindow.untilDay !== window.untilDay ||
+        nextWindow.sinceTime !== window.sinceTime ||
+        nextWindow.untilTime !== window.untilTime)
     ) {
       setWindowSelection({ days: windowDays, window: nextWindow });
     }
@@ -363,6 +378,13 @@ export function UsagePage() {
             </Toggle>
           ))}
         </ToggleGroup>
+        <UsageDateRangePicker
+          sinceDay={window.sinceDay}
+          untilDay={window.untilDay}
+          active={windowDays === "custom"}
+          disabled={showingLimits}
+          onSelect={selectRange}
+        />
         <Button
           onClick={refreshWindow}
           aria-label={showingLimits ? "Refresh limits" : "Refresh usage"}
@@ -414,7 +436,7 @@ export function UsagePage() {
             className="w-auto min-w-0"
           >
             <SelectValue>
-              {WINDOW_OPTIONS.find((option) => option.days === windowDays)?.label}
+              {WINDOW_OPTIONS.find((option) => option.days === windowDays)?.label ?? "Custom"}
             </SelectValue>
           </SelectTrigger>
           <SelectPopup align="end" alignItemWithTrigger={false}>
@@ -429,6 +451,13 @@ export function UsagePage() {
             ))}
           </SelectPopup>
         </Select>
+        <UsageDateRangePicker
+          sinceDay={window.sinceDay}
+          untilDay={window.untilDay}
+          active={windowDays === "custom"}
+          disabled={showingLimits}
+          onSelect={selectRange}
+        />
         <Button
           onClick={refreshWindow}
           aria-label={showingLimits ? "Refresh limits" : "Refresh usage"}
