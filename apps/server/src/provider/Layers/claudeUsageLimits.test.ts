@@ -86,6 +86,56 @@ describe("claudeUsageResponseToLimits", () => {
     ).toEqual({ overageIncluded: "Fable" });
   });
 
+  it("shows usage credits in dollars for metered accounts with no session or weekly windows", () => {
+    const { limits } = claudeUsageResponseToLimits({
+      checkedAt,
+      response: {
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: null,
+          seven_day: null,
+          extra_usage: {
+            is_enabled: true,
+            monthly_limit: 600_000,
+            used_credits: 504_000,
+            utilization: 84,
+            currency: "USD",
+            ...({ decimal_places: 2 } as object),
+          },
+        },
+      },
+    });
+    expect(limits.windows).toEqual([
+      {
+        id: "extra_usage",
+        kind: "monthly",
+        label: "Usage credits",
+        usedPercent: 84,
+        spend: { usedUsd: 5040, limitUsd: 6000 },
+      },
+    ]);
+  });
+
+  it("ignores usage credits that are off, uncapped, or not in dollars", () => {
+    for (const extra_usage of [
+      { is_enabled: false, monthly_limit: 600_000, used_credits: 1, utilization: 0 },
+      { is_enabled: true, monthly_limit: null, used_credits: 1, utilization: null },
+      {
+        is_enabled: true,
+        monthly_limit: 600_000,
+        used_credits: 1,
+        utilization: 0,
+        currency: "EUR",
+      },
+    ]) {
+      const { limits } = claudeUsageResponseToLimits({
+        checkedAt,
+        response: { rate_limits_available: true, rate_limits: { extra_usage } },
+      });
+      expect(limits.windows).toEqual([]);
+    }
+  });
+
   it("reports API key and Bedrock accounts as unsupported", () => {
     expect(
       claudeUsageResponseToLimits({

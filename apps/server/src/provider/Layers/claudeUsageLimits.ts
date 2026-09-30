@@ -183,9 +183,49 @@ export function claudeUsageResponseToLimits(input: {
     // skipped would let a mid-turn event open a row the probe never showed.
     overageIncluded ??= entry.display_name;
   }
+  const credits = usageCreditsWindow(response.rate_limits);
+  if (credits) windows.push(credits);
   return {
     limits: makeUsageLimits({ checkedAt, windows }),
     names: { overageIncluded },
+  };
+}
+
+/**
+ * Usage credits billed in dollars against a monthly limit: the only budget
+ * Enterprise and other metered accounts have, since their session and weekly
+ * windows are null. Amounts are minor units; `decimal_places` postdates the
+ * SDK typings we pin, so it is read structurally. Claude does not expose the
+ * billing period, so the window has no reset.
+ */
+function usageCreditsWindow(rateLimits: object): ServerProviderUsageWindow | undefined {
+  const raw = (rateLimits as { readonly extra_usage?: unknown }).extra_usage;
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const credits = raw as {
+    readonly is_enabled?: unknown;
+    readonly monthly_limit?: unknown;
+    readonly used_credits?: unknown;
+    readonly currency?: unknown;
+    readonly decimal_places?: unknown;
+  };
+  const { monthly_limit: limit, used_credits: used } = credits;
+  if (
+    credits.is_enabled !== true ||
+    (credits.currency != null && credits.currency !== "USD") ||
+    typeof limit !== "number" ||
+    typeof used !== "number" ||
+    !(limit > 0) ||
+    !Number.isFinite(used)
+  ) {
+    return undefined;
+  }
+  const divisor = 10 ** (typeof credits.decimal_places === "number" ? credits.decimal_places : 2);
+  return {
+    id: "extra_usage",
+    kind: "monthly",
+    label: "Usage credits",
+    usedPercent: clampPercent((used / limit) * 100),
+    spend: { usedUsd: Math.max(0, used) / divisor, limitUsd: limit / divisor },
   };
 }
 

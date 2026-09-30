@@ -30,10 +30,58 @@ const CursorUsageResponse = Schema.Struct({
   ),
 });
 
+const CursorTeams = Schema.Struct({
+  teams: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        id: Schema.Number,
+        hasBilling: Schema.optional(Schema.Boolean),
+        billingCycleStart: Schema.optional(Schema.String),
+        billingCycleEnd: Schema.optional(Schema.String),
+      }),
+    ),
+  ),
+});
+const CursorAggregatedUsage = Schema.Struct({ totalCostCents: Schema.optional(Schema.Number) });
+const CursorHardLimit = Schema.Struct({
+  perUserMonthlyLimitDollars: Schema.optional(Schema.Number),
+});
+
+type CursorBillingCycle = { readonly start: number; readonly end: number };
+
+/**
+ * The per-user spend limit on a team plan billed per use. Such accounts get
+ * no plan percentages, so this is the only bar they have. `totalCostCents`
+ * is the caller's own spend including Cursor's token fee, which is what the
+ * limit is enforced against.
+ */
+export function cursorSpendLimitWindow(input: {
+  readonly cycle: CursorBillingCycle;
+  readonly spentCents: number;
+  readonly limitDollars: number;
+}): ServerProviderUsageWindow | undefined {
+  const { cycle, spentCents, limitDollars } = input;
+  if (!(limitDollars > 0) || !Number.isFinite(spentCents) || !(cycle.end > cycle.start)) {
+    return undefined;
+  }
+  const usedUsd = Math.max(0, spentCents) / 100;
+  const reset = DateTime.make(cycle.end);
+  return {
+    id: "spendLimit",
+    kind: "monthly",
+    label: "Spend limit",
+    usedPercent: clampPercent((usedUsd / limitDollars) * 100),
+    windowDurationMins: Math.round((cycle.end - cycle.start) / 60_000),
+    ...(Option.isSome(reset) ? { resetsAt: DateTime.formatIso(reset.value) } : {}),
+    spend: { usedUsd, limitUsd: limitDollars },
+  };
+}
+
 /** Cursor's dashboard percentages include bonus usage; spend / limit does not. */
 export function cursorUsageResponseToLimits(
   response: typeof CursorUsageResponse.Type,
   checkedAt: string,
+  spendLimit?: ServerProviderUsageWindow,
 ) {
   const reset = DateTime.make(Number(response.billingCycleEnd));
   const resetsAt =
@@ -54,6 +102,7 @@ export function cursorUsageResponseToLimits(
       });
     }
   }
+  if (spendLimit) windows.push(spendLimit);
   return windows.length > 0
     ? makeUsageLimits({ checkedAt, windows })
     : makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
@@ -151,7 +200,48 @@ export const readCursorUsageLimits = Effect.fn("readCursorUsageLimits")(function
     const body = yield* HttpClientResponse.schemaBodyJson(CursorUsageResponse)(
       yield* HttpClientResponse.filterStatusOk(response),
     );
-    return cursorUsageResponseToLimits(body, checkedAt);
+    const dashboard = <S extends Schema.Top>(method: string, payload: object, schema: S) =>
+      client
+        .execute(
+          HttpClientRequest.post(`${endpoint}/aiserver.v1.DashboardService/${method}`).pipe(
+            HttpClientRequest.bearerToken(token),
+            HttpClientRequest.setHeaders({ "connect-protocol-version": "1" }),
+            HttpClientRequest.bodyJsonUnsafe(payload),
+          ),
+        )
+        .pipe(
+          Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)),
+        );
+    // Only the caller's own spend and limit are read; the team-wide spend
+    // listing names every member and is never requested.
+    const spendLimit = yield* Effect.gen(function* () {
+      const { teams = [] } = yield* dashboard("GetTeams", {}, CursorTeams);
+      const team = teams.find((candidate) => candidate.hasBilling);
+      if (!team?.billingCycleStart || !team.billingCycleEnd) return undefined;
+      const cycle = { start: Number(team.billingCycleStart), end: Number(team.billingCycleEnd) };
+      const [usage, limit] = yield* Effect.all(
+        [
+          dashboard(
+            "GetAggregatedUsageEvents",
+            {
+              teamId: team.id,
+              startDate: team.billingCycleStart,
+              endDate: team.billingCycleEnd,
+            },
+            CursorAggregatedUsage,
+          ),
+          dashboard("GetHardLimit", { teamId: team.id }, CursorHardLimit),
+        ],
+        { concurrency: 2 },
+      );
+      return cursorSpendLimitWindow({
+        cycle,
+        spentCents: usage.totalCostCents ?? 0,
+        limitDollars: limit.perUserMonthlyLimitDollars ?? 0,
+      });
+    }).pipe(Effect.orElseSucceed(() => undefined));
+    return cursorUsageResponseToLimits(body, checkedAt, spendLimit);
   }).pipe(
     Effect.timeout("10 seconds"),
     Effect.orElseSucceed(() =>
