@@ -73,6 +73,10 @@ export const OPENCODE2_INTERRUPT_PROMPT =
   "Run the shell command `sleep 60 && echo LATE` with the bash tool, then reply DONE.";
 export const OPENCODE2_COMPACTION_FIRST_PROMPT = "Remember the codeword PAPAYA. Reply OK.";
 export const OPENCODE2_COMPACTION_RECALL_PROMPT = "What was the codeword? One word.";
+export const OPENCODE2_RESTART_PROMPT =
+  "Run the shell command `sleep 25 && echo RESUMED` with the bash tool, then reply with its output.";
+export const OPENCODE2_RESTART_RECALL_PROMPT =
+  "What did I last ask you to run? Answer in one short sentence.";
 export const OPENCODE2_COMMAND_PROMPT = "/hello WORLD";
 export const OPENCODE2_SKILL_PROMPT = "Use $greet to say hi in three words.";
 export const TURN_INTERRUPT_PROMPT =

@@ -65,6 +65,22 @@ const operationOf = (
   if (method === "POST" && path === "/api/session") return { type: "session.create", input: body };
   if (method === "GET" && path === "/api/session/active") return { type: "session.active" };
   if (method === "GET" && path === "/api/command") return { type: "command.list", input: query };
+  const mcp = /^\/api\/experimental\/mcp\/([^/]+)$/.exec(path);
+  if (mcp !== null && method === "PUT") {
+    return { type: "mcp.add", input: { server: mcp[1], ...query, ...(body as object) } };
+  }
+  if (mcp !== null && method === "DELETE") {
+    return { type: "mcp.remove", input: { server: mcp[1], ...query } };
+  }
+  const entry = /^\/api\/experimental\/session\/([^/]+)\/instructions\/entries\/([^/]+)$/.exec(
+    path,
+  );
+  if (entry !== null && method === "PUT") {
+    return {
+      type: "session.instructions.entry.put",
+      input: { sessionID: entry[1], key: entry[2], ...(body as object) },
+    };
+  }
   if (method === "GET" && path === "/api/skill") return { type: "skill.list", input: query };
   if (session !== null) {
     const [, sessionID, rest = ""] = session;
@@ -74,6 +90,7 @@ const operationOf = (
     );
     const input = { sessionID, ...query, ...Object.fromEntries(fields) };
     if (method === "GET" && rest === "") return { type: "session.get", input };
+    if (method === "DELETE" && rest === "") return { type: "session.remove", input };
     if (method === "PATCH" && rest === "") return { type: "session.update", input };
     if (method === "POST" && rest === "/prompt") return { type: "session.prompt", input };
     if (method === "POST" && rest === "/command") return { type: "session.command", input };
@@ -99,11 +116,20 @@ const operationOf = (
   return { type: `${method} ${path}`, input: { ...query, body } };
 };
 
-/** An `HttpClient` that answers every request from the transcript. */
+/**
+ * An `HttpClient` that answers every request from the transcript. A successful
+ * `runtime_exit` ends the event stream: the server has stopped. When entries
+ * follow it, the server was restarted and the next `event.subscribe` opens its
+ * new stream; a transcript that ends there stays down, so every later request
+ * fails to connect as it would against a stopped server.
+ */
 const replayHttpClient = (controller: OpenCodeReplayController) =>
   HttpClient.make((request, url) =>
     Effect.tryPromise({
       try: async () => {
+        if (controller.exited && controller.finished) {
+          throw new Error("The replayed OpenCode server has exited.");
+        }
         const raw =
           request.body._tag === "Uint8Array"
             ? new TextDecoder().decode(request.body.body)
@@ -120,6 +146,7 @@ const replayHttpClient = (controller: OpenCodeReplayController) =>
         if (operation.type !== "event.subscribe") await controller.untilEventsDelivered();
         await controller.expectOutbound(operation);
         if (operation.type === "event.subscribe") {
+          controller.exited = false;
           const encoder = new TextEncoder();
           const frames = controller.events()[Symbol.asyncIterator]();
           const body = new ReadableStream<Uint8Array>({
@@ -152,10 +179,13 @@ const replayHttpClient = (controller: OpenCodeReplayController) =>
     }).pipe(Effect.map((response) => HttpClientResponse.fromWeb(request, response))),
   );
 
-/** The 2.x adapter over a replayed server, checking at scope close that the transcript ran out. */
-const makeReplayAdapter = (
+/**
+ * An OpenCode 2 server that answers from `transcript`, checking at scope close
+ * that the transcript ran out.
+ */
+export const replayServer = (
   transcript: ProviderReplayTranscript,
-  options?: { external?: boolean },
+  options?: { readonly external?: boolean },
 ) =>
   Effect.gen(function* () {
     const controller = new OpenCodeReplayController(transcript);
@@ -169,11 +199,18 @@ const makeReplayAdapter = (
       version: transcript.version,
       external: options?.external ?? false,
     };
+    return OpenCode2Server.OpenCode2Server.of({ withConnection: (use) => use(connection) });
+  });
+
+/** The 2.x adapter over a replayed server. */
+const makeReplayAdapter = (
+  transcript: ProviderReplayTranscript,
+  options?: { external?: boolean },
+) =>
+  Effect.gen(function* () {
+    const server = yield* replayServer(transcript, options);
     return yield* OpenCode2AdapterV2.make(ProviderInstanceId.make("opencode")).pipe(
-      Effect.provideService(
-        OpenCode2Server.OpenCode2Server,
-        OpenCode2Server.OpenCode2Server.of({ withConnection: (use) => use(connection) }),
-      ),
+      Effect.provideService(OpenCode2Server.OpenCode2Server, server),
     );
   });
 

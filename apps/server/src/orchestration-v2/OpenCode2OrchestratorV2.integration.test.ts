@@ -53,11 +53,14 @@ const event = (type: string, data: Record<string, unknown>): ProviderReplayEntry
     event: { id: `evt_${type.replaceAll(".", "")}`, created: 1, type, data },
   },
 });
-const T3_RULES = [
+/** T3's rules for a thread's session: only that thread's own T3 MCP server is allowed. */
+const t3Rules = (name: string) => [
   { action: "*", resource: "*", effect: "allow" },
   { action: "subagent", resource: "*", effect: "deny" },
+  { action: "t3-code-*", resource: "*", effect: "deny" },
+  { action: `t3-code-thread_${name}_*`, resource: "*", effect: "allow" },
 ];
-const sessionInfo = (directory: string, permissions: ReadonlyArray<unknown> = T3_RULES) => ({
+const sessionInfo = (directory: string, permissions: ReadonlyArray<unknown>) => ({
   data: {
     id: SESSION,
     projectID: "global",
@@ -69,6 +72,11 @@ const sessionInfo = (directory: string, permissions: ReadonlyArray<unknown> = T3
     permissions,
   },
 });
+/** T3's instructions entry, written before a thread's first prompt and whenever it changes. */
+const instructionsWritten: ReadonlyArray<ProviderReplayEntry> = [
+  out("session.instructions.entry.put", { sessionID: SESSION, key: "t3-code", value: "<any>" }),
+  reply("session.instructions.entry.put", null),
+];
 /** One prompt the server accepts and answers with `text`. */
 const answeredPrompt = (text: string): ReadonlyArray<ProviderReplayEntry> => [
   out("session.prompt", { sessionID: SESSION, text: "<any>" }),
@@ -108,7 +116,7 @@ const catalogModel = (id: string, name: string) => ({
   enabled: true,
   limit: { context: 200000, input: 160000, output: 32000 },
 });
-const createdSession = (directory: string): ReadonlyArray<ProviderReplayEntry> => [
+const createdSession = (directory: string, name: string): ReadonlyArray<ProviderReplayEntry> => [
   out("event.subscribe"),
   out("model.list", "<any>"),
   reply("model.list", {
@@ -119,7 +127,7 @@ const createdSession = (directory: string): ReadonlyArray<ProviderReplayEntry> =
     ],
   }),
   out("session.create", "<any>"),
-  reply("session.create", sessionInfo(directory)),
+  reply("session.create", sessionInfo(directory, t3Rules(name))),
 ];
 
 const threadCommands = (input: {
@@ -213,16 +221,18 @@ describe("OpenCode 2 through the orchestrator", () => {
             name,
             threadId: thread.threadId,
             entries: [
-              ...createdSession(cwd),
+              ...createdSession(cwd, name),
+              ...instructionsWritten,
               ...answeredPrompt("FIRST"),
               // The next turn resumes the session at its new selection.
               out("session.get", { sessionID: SESSION }),
-              reply("session.get", sessionInfo(cwd)),
+              reply("session.get", sessionInfo(cwd, t3Rules(name))),
               out("session.switchModel", {
                 sessionID: SESSION,
                 model: { providerID: "opencode", id: "mimo-v2.6-flash-free" },
               }),
               reply("session.switchModel", null),
+              ...instructionsWritten,
               ...answeredPrompt("SECOND"),
             ],
             commands: [
@@ -264,12 +274,15 @@ describe("OpenCode 2 through the orchestrator", () => {
         name,
         threadId: thread.threadId,
         entries: [
-          ...createdSession(before),
+          ...createdSession(before, name),
+          ...instructionsWritten,
           ...answeredPrompt("FIRST"),
           out("session.get", { sessionID: SESSION }),
-          reply("session.get", sessionInfo(before)),
+          reply("session.get", sessionInfo(before, t3Rules(name))),
           out("session.move", { sessionID: SESSION, directory: after }),
           reply("session.move", null),
+          // The moved thread reopens its session, which writes the entry again.
+          ...instructionsWritten,
           ...answeredPrompt("SECOND"),
         ],
         commands: [
@@ -302,7 +315,8 @@ describe("OpenCode 2 through the orchestrator", () => {
         name,
         threadId: thread.threadId,
         entries: [
-          ...createdSession(before),
+          ...createdSession(before, name),
+          ...instructionsWritten,
           ...answeredPrompt("FIRST"),
           // Reopened after a worktree change, the session reports the rules an
           // older build gave it; they are replaced before anything runs.
@@ -311,10 +325,12 @@ describe("OpenCode 2 through the orchestrator", () => {
             "session.get",
             sessionInfo(before, [{ action: "*", resource: "*", effect: "allow" }]),
           ),
-          out("session.update", { sessionID: SESSION, permissions: T3_RULES }),
+          out("session.update", { sessionID: SESSION, permissions: t3Rules(name) }),
           reply("session.update", null),
           out("session.move", { sessionID: SESSION, directory: after }),
           reply("session.move", null),
+          // The moved thread reopens its session, which writes the entry again.
+          ...instructionsWritten,
           ...answeredPrompt("SECOND"),
         ],
         commands: [
@@ -345,7 +361,7 @@ describe("OpenCode 2 through the orchestrator", () => {
         name,
         threadId: thread.threadId,
         // The session is created, then the turn is refused: no prompt is expected.
-        entries: createdSession(cwd),
+        entries: createdSession(cwd, name),
         commands: [thread.create, thread.message("refused")],
       });
       assert.deepEqual(

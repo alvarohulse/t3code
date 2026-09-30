@@ -23,6 +23,7 @@ import {
   Skill,
   type OpenCodeEvent,
 } from "@opencode/client/effect";
+import { Mcp } from "@opencode/schema/mcp";
 import type {
   OrchestrationV2ConversationMessage,
   OrchestrationV2ExecutionNode,
@@ -39,6 +40,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
+import * as Schedule from "effect/Schedule";
+import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -49,7 +52,9 @@ import {
   parseOpenCodeModelSlug,
   type OpenCodeRuntimeError,
 } from "../../provider/opencodeRuntime.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { buildRuntimeInstructions } from "../../provider/RuntimeInstructions.ts";
+import { t3OrchestrationSystemPrompt } from "../../provider/T3OrchestrationInstructions.ts";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
@@ -196,6 +201,11 @@ interface ActiveTurn {
   };
   steps: number;
   lastStep: Tokens | undefined;
+  /**
+   * The user (or compaction) message that started the turn: its prompt's
+   * answer, or its inbox item for a command. A reconnect backfills from here.
+   */
+  promptId: string | undefined;
   /** The compaction running in this turn, `/compact` or OpenCode's own when the context fills. */
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
@@ -223,6 +233,11 @@ interface ThreadState {
   model: ModelRef | undefined;
   /** The session's agent (`build`, `plan`, ...), undefined when OpenCode's default is in use. */
   agent: string | undefined;
+  /** T3's MCP server as registered for this thread, and the instructions entry sent with it. */
+  mcp:
+    | { readonly name: string; readonly directory: string; readonly credential: string }
+    | undefined;
+  instructions: string | undefined;
   /**
    * Set when a turn ended here while OpenCode may still be running it: a Stop
    * that timed out, or a prompt whose request failed without a clear answer.
@@ -269,11 +284,30 @@ const SESSION_PERMISSIONS = [
   { action: "subagent", resource: "*", effect: "deny" },
 ] as const;
 
+type PermissionRule = {
+  readonly action: string;
+  readonly resource: string;
+  readonly effect: "allow" | "deny" | "ask";
+};
+
+/**
+ * T3's MCP server is registered per directory, not per session, so each thread
+ * gets its own `t3-code-<thread>` entry with its own credential. OpenCode names
+ * an MCP tool's permission `<server>_<tool>` (non-alphanumerics become `_`), and
+ * the last matching rule wins: every thread's T3 server is denied, then this
+ * thread's own is allowed again.
+ */
+const t3McpServerName = (threadId: string) =>
+  `t3-code-${threadId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}`;
+const sessionRules = (threadId: string): ReadonlyArray<PermissionRule> => [
+  ...SESSION_PERMISSIONS,
+  { action: "t3-code-*", resource: "*", effect: "deny" },
+  { action: `${t3McpServerName(threadId)}_*`, resource: "*", effect: "allow" },
+];
+
 const sameRules = (
-  left:
-    | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: string }>
-    | undefined,
-  right: typeof SESSION_PERMISSIONS,
+  left: ReadonlyArray<PermissionRule> | undefined,
+  right: ReadonlyArray<PermissionRule>,
 ) =>
   left?.length === right.length &&
   left.every(
@@ -290,9 +324,17 @@ export const OPENCODE_2_FULL_ACCESS_ONLY =
 const QUESTION_REPLY = "Questions aren't supported by this OpenCode integration yet.";
 
 const INTERRUPT_TIMEOUT = "10 seconds";
+/** The session instructions entry T3 writes its per-turn system prompt to. */
+const INSTRUCTIONS_KEY = "t3-code";
 /** How long a turn waits on the directory's commands or skills before sending the text as is. */
 const INVENTORY_TIMEOUT = "5 seconds";
 const ACTIVE_CHECK_TIMEOUT = "5 seconds";
+/** A lost event stream is resubscribed this many times, this far apart, before the session breaks. */
+const RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = "2 seconds";
+const RECONCILE_TIMEOUT = "15 seconds";
+/** How long a new turn waits for a reconnect in progress. */
+const RECONNECT_WAIT = "30 seconds";
 /** Answers that mean the server refused a prompt; any other failure may have been accepted. */
 const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
   "InvalidRequestError",
@@ -395,11 +437,33 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   // Context windows by `provider/model`, from the latest `/api/model` read.
   const contextWindows = new Map<string, number>();
 
+  /**
+   * Lends the instance's server to a session until its scope closes. A spawned
+   * server that died is started again on the next borrow.
+   */
+  const borrow = Effect.gen(function* () {
+    const lent = yield* Deferred.make<OpenCode2Server.OpenCode2Connection, OpenCodeRuntimeError>();
+    yield* server
+      .withConnection((connection) =>
+        Deferred.succeed(lent, connection).pipe(Effect.andThen(Effect.never)),
+      )
+      .pipe(
+        Effect.catch((error) => Deferred.fail(lent, error)),
+        Effect.forkScoped,
+      );
+    return yield* Deferred.await(lent);
+  });
+
   const openSession = Effect.fn("OpenCode2Adapter.openSession")(function* (
     input: Parameters<ProviderAdapterV2Shape["openSession"]>[0],
-    connection: OpenCode2Server.OpenCode2Connection,
+    initial: {
+      readonly connection: OpenCode2Server.OpenCode2Connection;
+      readonly scope: Scope.Closeable;
+    },
   ) {
-    const { client } = connection;
+    let connection = initial.connection;
+    // Replaced when the session reconnects to a restarted server.
+    let client = connection.client;
     const sessionScope = yield* Effect.scope;
     const now = yield* DateTime.now;
     let session: OrchestrationV2ProviderSession = {
@@ -831,6 +895,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         return;
       }
       switch (event.type) {
+        case "session.inbox.enqueued":
+          if (turn.promptId === undefined && event.data.item.type !== "synthetic") {
+            turn.promptId = event.data.inboxID;
+          }
+          return;
         case "session.text.started":
         case "session.reasoning.started":
         case "session.text.delta":
@@ -915,12 +984,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       }
     });
 
-    // The stream is the only terminal signal, so a lost stream settles every
-    // running turn and breaks the session: T3 reopens it for the next turn.
-    // Set before the turns are settled, so a turn starting meanwhile sees it.
+    // The stream is the only terminal signal, and it is volatile: events sent
+    // while it is down are gone, and a restarted server never ends the
+    // execution it lost. So a lost stream reconnects, then reconciles each
+    // running turn from the server's own state (see `reconcile`). Only when
+    // reconnecting keeps failing are the turns failed and the session broken,
+    // so T3 reopens it. Set first, so a turn starting meanwhile waits or refuses.
     let streamFailure: string | undefined;
+    let reconnected = yield* Deferred.make<void>();
     const failAll = Effect.fnUntraced(function* (message: string) {
       streamFailure = message;
+      yield* Deferred.succeed(reconnected, undefined);
       for (const state of threads.values()) {
         const failure = makeProviderFailure({ message, class: "transport_error" });
         yield* finishTurn(state, { status: "failed", failure }, "broken");
@@ -928,16 +1002,147 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       yield* setSessionStatus("error", message);
       yield* Queue.end(events);
     });
-    // Subscribed before any session or prompt call, so no event of theirs is missed.
-    const stream = yield* connection.events;
-    yield* stream.pipe(
-      Stream.runForEach(handleEvent),
-      Effect.matchCauseEffect({
-        onSuccess: () => failAll("The OpenCode event stream ended."),
-        onFailure: () => failAll("The OpenCode event stream failed."),
-      }),
-      Effect.forkScoped,
+
+    /**
+     * Emits what a running turn missed while the stream was down, from the
+     * session's history since the turn's prompt: text, reasoning and tools,
+     * each under the same native id its live events would have used, so
+     * nothing already shown is duplicated. Returns how that history says the
+     * turn's execution ended: the `idle` item OpenCode appends after each one,
+     * or undefined when there is none after the prompt.
+     */
+    const backfill = Effect.fnUntraced(function* (sessionId: string, state: ThreadState) {
+      const turn = state.active;
+      if (turn?.promptId === undefined) return undefined;
+      const promptId = turn.promptId;
+      const recent = yield* paginate(
+        { sessionID: Session.ID.make(sessionId), order: "desc" as const, limit: 50 },
+        client.message.list,
+      ).pipe(
+        Stream.takeUntil((message) => message.id === promptId),
+        Stream.runCollect,
+      );
+      const idle = recent.find((message) => message.type === "idle");
+      for (const message of recent.toReversed()) {
+        if (message.type !== "assistant" || state.active !== turn) continue;
+        const ordinals = { text: 0, reasoning: 0 };
+        for (const part of message.content) {
+          if (part.type === "text" || part.type === "reasoning") {
+            const block = { assistantMessageID: message.id, ordinal: ordinals[part.type]++ };
+            yield* emitText(state, turn, block, part.type, () => part.text, true);
+            continue;
+          }
+          if (part.type !== "tool") continue;
+          if (!turn.tools.has(part.id)) {
+            turn.tools.set(part.id, { name: part.name, input: {} });
+            turn.startedAt.set(part.id, yield* DateTime.now);
+          }
+          const tool = turn.tools.get(part.id)!;
+          if (typeof part.state.input === "object" && part.state.input !== null) {
+            tool.input = part.state.input as Record<string, unknown>;
+          }
+          if (part.state.status === "completed") {
+            yield* emitTool(state, turn, part.id, "completed", {
+              output: textOf(part.state.content),
+              metadata: part.state.metadata,
+            });
+            turn.tools.delete(part.id);
+          } else if (part.state.status === "error") {
+            yield* emitTool(state, turn, part.id, "failed", {
+              output: part.state.error.message,
+              metadata: part.state.metadata,
+            });
+            turn.tools.delete(part.id);
+          } else {
+            yield* emitTool(state, turn, part.id, "running");
+          }
+        }
+      }
+      return idle === undefined ? undefined : { outcome: idle.outcome };
+    });
+
+    /**
+     * Settles each turn that was running when the stream dropped, from the
+     * server: a session still running keeps its turn (its next events arrive on
+     * the new stream); one that stopped ends the turn with the outcome of the
+     * `idle` item after its prompt. A restarted server writes no such item for
+     * the execution it lost, and `session.outcome` is still the previous
+     * execution's, so no `idle` means the turn was interrupted.
+     */
+    const reconcile = Effect.gen(function* () {
+      const running = [...threads].filter(([, state]) => state.active !== undefined);
+      if (running.length === 0) return;
+      const active = yield* client.session.active();
+      for (const [sessionId, state] of running) {
+        const turn = state.active;
+        if (turn === undefined) continue;
+        const ended = yield* backfill(sessionId, state);
+        if (sessionId in active || state.active !== turn) continue;
+        yield* finishTurn(
+          state,
+          ended?.outcome === "succeeded"
+            ? { status: turn.interrupted ? "interrupted" : "completed" }
+            : ended?.outcome === "failed"
+              ? {
+                  status: "failed",
+                  failure: makeProviderFailure({
+                    message:
+                      "OpenCode ended the turn with an error while T3 Code was reconnecting.",
+                    class: "provider_error",
+                  }),
+                }
+              : { status: "interrupted" },
+        );
+      }
+    });
+
+    /**
+     * Subscribes again, on a restarted server if the old one is gone, and
+     * reconciles. Retried a few times; the caller fails everything after that.
+     */
+    const reconnect = Effect.gen(function* () {
+      const scope = yield* Scope.make();
+      const next = yield* borrow.pipe(
+        Effect.provideService(Scope.Scope, scope),
+        Effect.tapError(() => Scope.close(scope, Exit.void)),
+      );
+      const stream = yield* next.events.pipe(Effect.tapError(() => Scope.close(scope, Exit.void)));
+      const previous = currentScope;
+      connection = next;
+      client = next.client;
+      currentScope = scope;
+      yield* Scope.close(previous, Exit.void);
+      // A restarted server forgot T3's MCP servers; the next turn adds them again.
+      for (const state of threads.values()) state.mcp = undefined;
+      yield* reconcile.pipe(Effect.timeout(RECONCILE_TIMEOUT));
+      return stream;
+    }).pipe(
+      Effect.retry({ times: RECONNECT_ATTEMPTS - 1, schedule: Schedule.spaced(RECONNECT_DELAY) }),
     );
+
+    let currentScope = initial.scope;
+    const follow = (stream: Stream.Stream<OpenCode2StreamEvent, unknown>): Effect.Effect<void> =>
+      stream.pipe(
+        Stream.runForEach(handleEvent),
+        Effect.exit,
+        Effect.flatMap(() =>
+          Effect.gen(function* () {
+            streamFailure = "The OpenCode event stream was lost. Reconnecting.";
+            yield* Effect.logWarning("Lost the OpenCode event stream; reconnecting.");
+            const next = yield* reconnect.pipe(Effect.option);
+            if (next._tag === "None") {
+              return yield* failAll("The OpenCode event stream was lost and could not reconnect.");
+            }
+            streamFailure = undefined;
+            const done = reconnected;
+            reconnected = yield* Deferred.make<void>();
+            yield* Deferred.succeed(done, undefined);
+            return yield* follow(next.value);
+          }),
+        ),
+      );
+    // Subscribed before any session or prompt call, so no event of theirs is missed.
+    yield* follow(yield* connection.events).pipe(Effect.forkScoped);
 
     // A server T3 did not start keeps running after T3 stops, so stop the turns
     // it would otherwise finish unseen. A spawned server stops with its owner.
@@ -956,23 +1161,23 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
 
     // Context windows come from the server's model list, read when the session
     // opens and again after a turn whose model had none yet.
-    const readModels = client.model
-      .list({ location: { directory: session.cwd ?? serverConfig.cwd } })
-      .pipe(
-        Effect.timeout("5 seconds"),
-        Effect.tap((models) =>
-          Effect.sync(() => {
-            for (const model of models.data) {
-              // A model's input limit, when it has one, is its real headroom.
-              contextWindows.set(
-                `${model.providerID}/${model.id}`,
-                model.limit.input ?? model.limit.context,
-              );
-            }
-          }),
-        ),
-        Effect.ignore({ log: true }),
-      );
+    const readModels = Effect.suspend(() =>
+      client.model.list({ location: { directory: session.cwd ?? serverConfig.cwd } }),
+    ).pipe(
+      Effect.timeout("5 seconds"),
+      Effect.tap((models) =>
+        Effect.sync(() => {
+          for (const model of models.data) {
+            // A model's input limit, when it has one, is its real headroom.
+            contextWindows.set(
+              `${model.providerID}/${model.id}`,
+              model.limit.input ?? model.limit.context,
+            );
+          }
+        }),
+      ),
+      Effect.ignore({ log: true }),
+    );
     yield* readModels;
 
     const register = (
@@ -993,23 +1198,104 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         active: undefined,
         model: native.model,
         agent: native.agent,
+        mcp: undefined,
+        instructions: undefined,
         unsettled: false,
       });
       return providerThread;
     };
 
-    const promptText = (turnInput: ProviderAdapterV2TurnInput) => {
-      const text = providerMessageTextWithAttachmentPaths({
+    const promptText = (turnInput: ProviderAdapterV2TurnInput) =>
+      providerMessageTextWithAttachmentPaths({
         text: turnInput.message.text,
         attachments: turnInput.message.attachments,
         attachmentsDir: serverConfig.attachmentsDir,
       }).trim();
-      const instructions = buildRuntimeInstructions({
-        harness: "OpenCode",
-        model: turnInput.modelSelection.model,
-      });
-      return `${text}\n\n${instructions}`;
-    };
+
+    /**
+     * T3's MCP server for this thread, and the per-turn instructions. The MCP
+     * server is registered for the session's directory under the thread's own
+     * name and credential (the session rules allow only it), and removed when
+     * the thread unloads or the session closes. OpenCode 2 has no per-prompt
+     * system field, so the instructions are a session instructions entry,
+     * which applies from the next step; it is only rewritten when it changes.
+     */
+    const prepareTurn = Effect.fnUntraced(function* (
+      sessionId: string,
+      state: ThreadState,
+      turnInput: ProviderAdapterV2TurnInput,
+    ) {
+      const mcpSession = McpProviderSession.readMcpProviderSession(turnInput.threadId);
+      const directory = turnInput.runtimePolicy.cwd ?? serverConfig.cwd;
+      const name = t3McpServerName(turnInput.threadId);
+      // An external server may not reach T3's MCP endpoint, as with 1.x.
+      const wanted =
+        mcpSession === undefined || connection.external
+          ? undefined
+          : { name, directory, credential: mcpSession.authorizationHeader };
+      if (
+        state.mcp !== undefined &&
+        (wanted === undefined ||
+          state.mcp.directory !== wanted.directory ||
+          state.mcp.credential !== wanted.credential)
+      ) {
+        yield* removeMcp(state.mcp);
+        state.mcp = undefined;
+      }
+      // T3's tools are an addition: a server that cannot add them still runs the turn.
+      if (wanted !== undefined && state.mcp === undefined) {
+        const added = yield* client.mcp
+          .add({
+            server: name,
+            location: { directory },
+            config: new Mcp.RemoteConfig({
+              type: "remote",
+              url: mcpSession!.endpoint,
+              headers: { Authorization: wanted.credential },
+              oauth: false,
+            }),
+          })
+          .pipe(
+            Effect.timeout(INVENTORY_TIMEOUT),
+            Effect.as(true),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Could not add T3 Code's MCP server to OpenCode.", cause).pipe(
+                Effect.as(false),
+              ),
+            ),
+          );
+        if (added) state.mcp = wanted;
+      }
+      const instructions = [
+        buildRuntimeInstructions({ harness: "OpenCode", model: turnInput.modelSelection.model }),
+        t3OrchestrationSystemPrompt(state.mcp !== undefined),
+      ]
+        .filter((part) => part !== undefined && part.length > 0)
+        .join("\n\n");
+      if (instructions !== state.instructions) {
+        yield* client.session.instructions.entry.put({
+          sessionID: Session.ID.make(sessionId),
+          key: INSTRUCTIONS_KEY,
+          value: instructions,
+        });
+        state.instructions = instructions;
+      }
+    });
+
+    const removeMcp = (mcp: { readonly name: string; readonly directory: string }) =>
+      client.mcp
+        .remove({ server: mcp.name, location: { directory: mcp.directory } })
+        .pipe(Effect.timeout("5 seconds"), Effect.ignore({ log: true }));
+
+    // T3's MCP registrations outlive a session only on an external server; a
+    // spawned one forgets them when it stops.
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        [...threads.values()].flatMap((state) => (state.mcp === undefined ? [] : [state.mcp])),
+        removeMcp,
+        { concurrency: 8, discard: true },
+      ),
+    );
 
     /**
      * What a turn sends: `/compact` compacts, `/name args` naming a workspace
@@ -1025,7 +1311,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const text = turnInput.message.text.trim();
       const bare = turnInput.message.attachments.length === 0;
       if (bare && text === "/compact") {
-        return yield* client.session.compact({ sessionID }).pipe(Effect.asVoid);
+        return (yield* client.session.compact({ sessionID })).id;
       }
       const location = { directory: turnInput.runtimePolicy.cwd ?? serverConfig.cwd };
       const command = bare ? commandOf(text) : undefined;
@@ -1036,7 +1322,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           Effect.orElseSucceed(() => []),
         );
         if (commands.some((entry) => entry.name === command.name)) {
-          return yield* client.session.command({ sessionID, ...command });
+          yield* client.session.command({ sessionID, ...command });
+          return undefined;
         }
       }
       const skills = SKILL_MENTION.test(text)
@@ -1049,15 +1336,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ),
           )
         : [];
-      return yield* client.session
-        .prompt({
-          sessionID,
-          text: promptText(turnInput),
-          ...(skills.length === 0
-            ? {}
-            : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
-        })
-        .pipe(Effect.asVoid);
+      const accepted = yield* client.session.prompt({
+        sessionID,
+        text: promptText(turnInput),
+        ...(skills.length === 0 ? {} : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
+      });
+      return accepted.id;
     });
 
     const runtime: ProviderAdapterV2SessionRuntime = {
@@ -1092,7 +1376,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               directory: AbsolutePath.make(threadInput.runtimePolicy.cwd ?? serverConfig.cwd),
             }),
             model,
-            permissions: SESSION_PERMISSIONS,
+            permissions: sessionRules(threadInput.threadId),
           });
           const createdAt = yield* DateTime.now;
           const providerThread: OrchestrationV2ProviderThread = {
@@ -1134,10 +1418,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const native = yield* client.session.get({ sessionID: Session.ID.make(sessionId) });
           // A session made by 1.x or an earlier build may still allow what
           // T3 now denies, such as subagents.
-          if (!sameRules(native.permissions, SESSION_PERMISSIONS)) {
+          const rules = sessionRules(
+            threadInput.threadId ?? threadInput.providerThread.appThreadId ?? "",
+          );
+          if (!sameRules(native.permissions, rules)) {
             yield* client.session.update({
               sessionID: Session.ID.make(sessionId),
-              permissions: SESSION_PERMISSIONS,
+              permissions: rules,
             });
           }
           // A thread moved to another worktree takes its session with it.
@@ -1189,6 +1476,18 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               detail: `OpenCode session ${sessionId} already has an active turn`,
             });
           }
+          // A lost stream is reconnecting: wait for it rather than prompt into
+          // a dead stream, and refuse the turn before any request if it gave up.
+          if (streamFailure !== undefined) {
+            yield* Deferred.await(reconnected).pipe(Effect.timeout(RECONNECT_WAIT), Effect.ignore);
+          }
+          if (streamFailure !== undefined) {
+            return yield* new ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: input.providerSessionId,
+              cause: streamFailure,
+            });
+          }
           // After a timed-out Stop the server says whether that run is gone. A
           // run still going is stopped again and this turn fails so it can be
           // sent again; a run that is gone may still have its end on the
@@ -1234,6 +1533,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               usage: { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0 },
               steps: 0,
               lastStep: undefined,
+              promptId: undefined,
               compaction: undefined,
               compactions: 0,
               interrupted: false,
@@ -1306,8 +1606,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
             state.model = model;
           }
+          yield* prepareTurn(sessionId, state, turnInput);
           const turn = yield* begin;
           yield* submit(sessionId, turnInput).pipe(
+            Effect.tap((promptId) =>
+              Effect.sync(() => {
+                if (promptId !== undefined) turn.promptId ??= promptId;
+              }),
+            ),
             // Deleted outside T3: the thread is broken, and forgetting it makes
             // the next turn resume, fail, and recreate it with a handoff.
             Effect.catchTags({
@@ -1412,15 +1718,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           ),
         ),
       unloadThread: ({ providerThread }) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           const nativeId = providerThread.nativeThreadRef?.nativeId;
-          if (
-            nativeId !== undefined &&
-            nativeId !== null &&
-            threads.get(nativeId)?.active === undefined
-          ) {
-            threads.delete(nativeId);
-          }
+          if (nativeId === undefined || nativeId === null) return;
+          const state = threads.get(nativeId);
+          if (state === undefined || state.active !== undefined) return;
+          threads.delete(nativeId);
+          if (state.mcp !== undefined) yield* removeMcp(state.mcp);
         }),
       respondToRuntimeRequest: (requestInput) =>
         Effect.fail(
@@ -1524,19 +1828,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     // spawned server is not idle-stopped under a long tool call.
     openSession: (input) =>
       Effect.gen(function* () {
-        const lent = yield* Deferred.make<
-          OpenCode2Server.OpenCode2Connection,
-          OpenCodeRuntimeError
-        >();
-        yield* server
-          .withConnection((connection) =>
-            Deferred.succeed(lent, connection).pipe(Effect.andThen(Effect.never)),
-          )
-          .pipe(
-            Effect.catch((error) => Deferred.fail(lent, error)),
-            Effect.forkScoped,
-          );
-        return yield* openSession(input, yield* Deferred.await(lent));
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer((exit) => Scope.close(scope, exit));
+        const connection = yield* borrow.pipe(Effect.provideService(Scope.Scope, scope));
+        return yield* openSession(input, { connection, scope });
       }).pipe(
         Effect.mapError(
           (cause) =>

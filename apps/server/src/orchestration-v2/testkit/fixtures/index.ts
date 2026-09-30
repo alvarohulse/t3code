@@ -57,6 +57,8 @@ import { openCode2CompactionInput } from "./opencode2_compaction/input.ts";
 import { assertOpenCode2CompactionOutput } from "./opencode2_compaction/output.ts";
 import { openCode2InterruptInput } from "./opencode2_interrupt/input.ts";
 import { assertOpenCode2InterruptOutput } from "./opencode2_interrupt/output.ts";
+import { openCode2ResumeAfterRestartInput } from "./opencode2_resume_after_restart/input.ts";
+import { assertOpenCode2ResumeAfterRestartOutput } from "./opencode2_resume_after_restart/output.ts";
 import { openCode2SimpleInput } from "./opencode2_simple/input.ts";
 import { openCode2SkillInput } from "./opencode2_skill/input.ts";
 import { assertOpenCode2SkillOutput } from "./opencode2_skill/output.ts";
@@ -805,6 +807,24 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
           model: "opencode/big-pickle",
         },
         assertOutput: assertOpenCode2CompactionOutput,
+      },
+    ],
+  },
+  {
+    name: "opencode2_resume_after_restart",
+    buildInput: openCode2ResumeAfterRestartInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("opencode"),
+        transcriptFile: new URL(
+          "./opencode2_resume_after_restart/opencode_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: {
+          instanceId: OPENCODE2_MODEL_SELECTION.instanceId,
+          model: "opencode/big-pickle",
+        },
+        assertOutput: assertOpenCode2ResumeAfterRestartOutput,
       },
     ],
   },
