@@ -24,6 +24,8 @@ export interface ModelRate {
   readonly outputCostPerToken: number;
   readonly cacheReadCostPerToken: number;
   readonly cacheCreationCostPerToken: number;
+  /** Rate for writes to the 1-hour cache; `cacheCreationCostPerToken` covers the 5-minute cache. */
+  readonly cacheCreation1hCostPerToken: number;
   /**
    * Multiple of the rates above billed for a fast-mode request, from LiteLLM's
    * `provider_specific_entry.fast`. `1` when the model publishes no fast tier.
@@ -41,18 +43,22 @@ export function createOverrideRateTable(
   overrides: Readonly<Record<string, UsageModelPriceOverride>>,
 ): RateTable {
   return new Map(
-    Object.entries(overrides).map(([model, prices]) => [
-      model.trim(),
-      {
-        inputCostPerToken: prices.inputCostPerMillionTokens / 1_000_000,
-        outputCostPerToken: prices.outputCostPerMillionTokens / 1_000_000,
-        cacheReadCostPerToken:
-          (prices.cacheReadCostPerMillionTokens ?? prices.inputCostPerMillionTokens) / 1_000_000,
-        cacheCreationCostPerToken:
-          (prices.cacheWriteCostPerMillionTokens ?? prices.inputCostPerMillionTokens) / 1_000_000,
-        fastMultiplier: 1,
-      },
-    ]),
+    Object.entries(overrides).map(([model, prices]) => {
+      const cacheCreationCostPerToken =
+        (prices.cacheWriteCostPerMillionTokens ?? prices.inputCostPerMillionTokens) / 1_000_000;
+      return [
+        model.trim(),
+        {
+          inputCostPerToken: prices.inputCostPerMillionTokens / 1_000_000,
+          outputCostPerToken: prices.outputCostPerMillionTokens / 1_000_000,
+          cacheReadCostPerToken:
+            (prices.cacheReadCostPerMillionTokens ?? prices.inputCostPerMillionTokens) / 1_000_000,
+          cacheCreationCostPerToken,
+          cacheCreation1hCostPerToken: cacheCreationCostPerToken,
+          fastMultiplier: 1,
+        },
+      ];
+    }),
   );
 }
 
@@ -62,6 +68,7 @@ interface LiteLlmEntry {
   readonly output_cost_per_token?: unknown;
   readonly cache_read_input_token_cost?: unknown;
   readonly cache_creation_input_token_cost?: unknown;
+  readonly cache_creation_input_token_cost_above_1hr?: unknown;
   readonly provider_specific_entry?: unknown;
 }
 
@@ -100,14 +107,17 @@ export function parseRateTable(document: unknown): RateTable {
 
     const key = normalizeRateKey(name);
     if (key.length === 0) continue;
+    // Anthropic bills cache reads at a discount and cache writes at a
+    // premium. When a model omits them, cached input is priced as plain
+    // input rather than as free.
+    const cacheCreationCostPerToken = finiteNumber(entry.cache_creation_input_token_cost) ?? input;
     table.set(key, {
       inputCostPerToken: input,
       outputCostPerToken: output,
-      // Anthropic bills cache reads at a discount and cache writes at a
-      // premium. When a model omits them, cached input is priced as plain
-      // input rather than as free.
       cacheReadCostPerToken: finiteNumber(entry.cache_read_input_token_cost) ?? input,
-      cacheCreationCostPerToken: finiteNumber(entry.cache_creation_input_token_cost) ?? input,
+      cacheCreationCostPerToken,
+      cacheCreation1hCostPerToken:
+        finiteNumber(entry.cache_creation_input_token_cost_above_1hr) ?? cacheCreationCostPerToken,
       fastMultiplier: fastMultiplier(entry),
     });
   }
@@ -137,6 +147,7 @@ function sameRate(a: ModelRate, b: ModelRate): boolean {
     a.outputCostPerToken === b.outputCostPerToken &&
     a.cacheReadCostPerToken === b.cacheReadCostPerToken &&
     a.cacheCreationCostPerToken === b.cacheCreationCostPerToken &&
+    a.cacheCreation1hCostPerToken === b.cacheCreation1hCostPerToken &&
     a.fastMultiplier === b.fastMultiplier
   );
 }
@@ -186,7 +197,7 @@ export function lookupRate(table: RateTable, model: string): ModelRate | null {
 /** The parts of a transcript record that decide its price. */
 export type PricedRecord = Pick<
   UsageRecord,
-  "model" | "rateModel" | "totals" | "fast" | "reportedCostUsd"
+  "model" | "rateModel" | "totals" | "cacheCreation1hTokens" | "fast" | "reportedCostUsd"
 >;
 
 export interface PricedUsage {
@@ -214,10 +225,12 @@ export function priceUsage(
   const rate = override ?? lookupRate(table, record.rateModel ?? model);
   if (rate === null) return { costUsd: 0, costSource: "unpriced" };
 
+  const cacheCreation1hTokens = record.cacheCreation1hTokens ?? 0;
   const standardCostUsd =
     totals.uncachedInputTokens * rate.inputCostPerToken +
     totals.cachedInputTokens * rate.cacheReadCostPerToken +
-    totals.cacheCreationTokens * rate.cacheCreationCostPerToken +
+    (totals.cacheCreationTokens - cacheCreation1hTokens) * rate.cacheCreationCostPerToken +
+    cacheCreation1hTokens * rate.cacheCreation1hCostPerToken +
     totals.outputTokens * rate.outputCostPerToken;
 
   return {

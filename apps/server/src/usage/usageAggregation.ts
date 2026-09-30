@@ -14,8 +14,23 @@
  */
 import type { UsageBucket, UsageDay, UsageResolution, UsageTokenTotals } from "@t3tools/contracts";
 
-import { addTotals, EMPTY_TOTALS, type UsageRecord } from "./usageTranscripts.ts";
+import {
+  addTotals,
+  EMPTY_TOTALS,
+  isLargerUsageSnapshot,
+  type UsageRecord,
+} from "./usageTranscripts.ts";
 import { cacheSavingsUsd, priceUsage, type RateTable } from "./usagePricing.ts";
+
+function scaleTotals(totals: UsageTokenTotals, sign: 1 | -1): UsageTokenTotals {
+  return {
+    uncachedInputTokens: sign * totals.uncachedInputTokens,
+    cachedInputTokens: sign * totals.cachedInputTokens,
+    cacheCreationTokens: sign * totals.cacheCreationTokens,
+    outputTokens: sign * totals.outputTokens,
+    reasoningTokens: sign * totals.reasoningTokens,
+  };
+}
 
 /**
  * Formats an instant as a `YYYY-MM-DD` day in `timeZone`.
@@ -80,11 +95,16 @@ export interface AggregateResult {
  *
  * De-duplication is global across the whole scan, not per file: Claude Code
  * copies a message's records forward when a session is resumed or forked, so
- * the same `dedupeKey` legitimately appears in several transcripts.
+ * the same `dedupeKey` legitimately appears in several transcripts. Each key
+ * counts once, in the bucket of its first record, at its largest snapshot.
  */
 export class UsageAggregator {
   readonly #buckets = new Map<string, MutableBucket>();
-  readonly #seen = new Set<string>();
+  /** The counted record per key, and its bucket (`null` when out of window). */
+  readonly #seen = new Map<
+    string,
+    { record: UsageRecord; readonly bucket: MutableBucket | null }
+  >();
   readonly #toDay: (timestampMs: number) => string;
   readonly #hourlyWindow: { readonly sinceTimeMs: number; readonly untilTimeMs: number } | null;
   readonly #options: AggregateOptions;
@@ -113,21 +133,50 @@ export class UsageAggregator {
    * that landed rather than everything the mtime prefilter happened to admit.
    */
   add(record: UsageRecord, sourcePath?: string): boolean {
-    if (record.dedupeKey !== null) {
-      if (this.#seen.has(record.dedupeKey)) {
-        this.#duplicatesDropped += 1;
-        return false;
+    const counted = record.dedupeKey === null ? undefined : this.#seen.get(record.dedupeKey);
+    if (counted !== undefined) {
+      this.#duplicatesDropped += 1;
+      if (isLargerUsageSnapshot(record, counted.record)) {
+        if (counted.bucket !== null) {
+          this.#apply(counted.bucket, counted.record, -1);
+          this.#apply(counted.bucket, record, 1);
+        }
+        counted.record = record;
       }
-      this.#seen.add(record.dedupeKey);
+      return false;
     }
 
+    const bucket = this.#bucketFor(record, sourcePath);
+    if (record.dedupeKey !== null) this.#seen.set(record.dedupeKey, { record, bucket });
+    if (bucket === null) {
+      this.#outOfWindow += 1;
+      return false;
+    }
+
+    this.#apply(bucket, record, 1);
+    bucket.records += 1;
+    if (record.sessionId.length > 0) bucket.sessions.add(record.sessionId);
+    return true;
+  }
+
+  /** Adds (`sign = 1`) or removes (`sign = -1`) a record's tokens and cost. */
+  #apply(bucket: MutableBucket, record: UsageRecord, sign: 1 | -1): void {
+    const priced = priceUsage(this.#options.rates, record, this.#options.priceOverrides);
+    bucket.totals = addTotals(bucket.totals, scaleTotals(record.totals, sign));
+    bucket.costUsd += sign * priced.costUsd;
+    bucket.cacheSavingsUsd +=
+      sign * cacheSavingsUsd(this.#options.rates, record, this.#options.priceOverrides);
+    if (priced.costSource === "unpriced") bucket.unpricedRecords += sign;
+    if (priced.costSource === "providerReported") bucket.providerReportedRecords += sign;
+  }
+
+  #bucketFor(record: UsageRecord, sourcePath: string | undefined): MutableBucket | null {
     if (
       this.#hourlyWindow !== null &&
       (record.timestampMs < this.#hourlyWindow.sinceTimeMs ||
         record.timestampMs >= this.#hourlyWindow.untilTimeMs)
     ) {
-      this.#outOfWindow += 1;
-      return false;
+      return null;
     }
 
     const day = this.#toDay(record.timestampMs);
@@ -135,8 +184,7 @@ export class UsageAggregator {
       this.#hourlyWindow === null &&
       (day < this.#options.sinceDay || day > this.#options.untilDay)
     ) {
-      this.#outOfWindow += 1;
-      return false;
+      return null;
     }
 
     const hourStart =
@@ -160,21 +208,7 @@ export class UsageAggregator {
       };
       this.#buckets.set(key, bucket);
     }
-
-    const priced = priceUsage(this.#options.rates, record, this.#options.priceOverrides);
-
-    bucket.totals = addTotals(bucket.totals, record.totals);
-    bucket.costUsd += priced.costUsd;
-    bucket.cacheSavingsUsd += cacheSavingsUsd(
-      this.#options.rates,
-      record,
-      this.#options.priceOverrides,
-    );
-    bucket.records += 1;
-    if (priced.costSource === "unpriced") bucket.unpricedRecords += 1;
-    if (priced.costSource === "providerReported") bucket.providerReportedRecords += 1;
-    if (record.sessionId.length > 0) bucket.sessions.add(record.sessionId);
-    return true;
+    return bucket;
   }
 
   finish(): AggregateResult {

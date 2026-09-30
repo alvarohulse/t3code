@@ -16,6 +16,7 @@ function claudeLine(overrides: {
   model?: string;
   outputTokens?: number;
   speed?: string;
+  cacheCreation?: Record<string, number>;
 }): string {
   return JSON.stringify({
     type: "assistant",
@@ -33,6 +34,9 @@ function claudeLine(overrides: {
         cache_read_input_tokens: 1000,
         output_tokens: overrides.outputTokens ?? 286,
         ...(overrides.speed === undefined ? {} : { speed: overrides.speed }),
+        ...(overrides.cacheCreation === undefined
+          ? {}
+          : { cache_creation: overrides.cacheCreation }),
       },
     },
   });
@@ -64,9 +68,27 @@ describe("parseClaudeLine", () => {
     expect(line("standard")?.fast).toBe(false);
   });
 
+  it("separates 1-hour cache writes, capped at the reported cache writes", () => {
+    const line = (cacheCreation?: Record<string, number>) =>
+      parseClaudeLine(
+        claudeLine({
+          messageId: "msg_1",
+          contentType: "text",
+          ...(cacheCreation === undefined ? {} : { cacheCreation }),
+        }),
+      );
+
+    expect(
+      line({ ephemeral_5m_input_tokens: 818, ephemeral_1h_input_tokens: 66000 })
+        ?.cacheCreation1hTokens,
+    ).toBe(66000);
+    expect(line({ ephemeral_1h_input_tokens: 99_999_999 })?.cacheCreation1hTokens).toBe(66818);
+    expect(line()?.cacheCreation1hTokens).toBeUndefined();
+  });
+
   it("gives every content block of one message the same dedupe key", () => {
-    // T3 Code writes one record per content block, each repeating the parent
-    // message's full usage. Summing them would overcount ~2.4x on real data.
+    // Claude Code writes one record per content block, each carrying the parent
+    // message's usage. Summing them would overcount ~2.4x on real data.
     const text = parseClaudeLine(claudeLine({ messageId: "msg_2", contentType: "text" }));
     const toolUse = parseClaudeLine(claudeLine({ messageId: "msg_2", contentType: "tool_use" }));
 

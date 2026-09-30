@@ -12,6 +12,7 @@ const rates: RateTable = new Map([
       outputCostPerToken: 5e-5,
       cacheReadCostPerToken: 1e-6,
       cacheCreationCostPerToken: 1.25e-5,
+      cacheCreation1hCostPerToken: 2e-5,
       fastMultiplier: 1,
     },
   ],
@@ -76,7 +77,7 @@ describe("UsageAggregator", () => {
     ).toThrow("requires exact time bounds");
   });
 
-  it("keeps only the first record for a repeated dedupe key", () => {
+  it("counts a repeated dedupe key once", () => {
     const result = aggregate([
       record({ dedupeKey: "msg_1:" }),
       record({ dedupeKey: "msg_1:" }),
@@ -87,6 +88,27 @@ describe("UsageAggregator", () => {
     expect(result.buckets).toHaveLength(1);
     expect(result.buckets[0]?.records).toBe(1);
     expect(result.buckets[0]?.totals.outputTokens).toBe(50);
+  });
+
+  it("counts a repeated dedupe key at its largest snapshot, in its first bucket", () => {
+    const snapshot = (outputTokens: number, timestamp: string) =>
+      record({
+        dedupeKey: "msg_1:",
+        timestampMs: Date.parse(timestamp),
+        totals: { ...record().totals, outputTokens },
+      });
+    const result = aggregate([
+      snapshot(5, "2026-08-07T23:59:59.000Z"),
+      snapshot(500, "2026-08-08T00:00:01.000Z"),
+      snapshot(50, "2026-08-08T00:00:02.000Z"),
+    ]);
+
+    expect(result.buckets.map((bucket) => [bucket.day, bucket.records])).toEqual([
+      ["2026-08-07", 1],
+    ]);
+    expect(result.buckets[0]?.totals.outputTokens).toBe(500);
+    // 100*1e-5 + 1000*1e-6 + 10*1.25e-5 + 500*5e-5
+    expect(result.buckets[0]?.costUsd).toBeCloseTo(0.027125, 9);
   });
 
   it("still sums records that carry no dedupe key", () => {
