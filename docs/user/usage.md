@@ -38,6 +38,9 @@ On web and desktop, use the environment dropdown to filter costs, tokens, and li
 environments are selected by default. The dropdown shows which environments are still scanning;
 results appear as each one responds.
 
+On web and desktop, choose the calendar button beside the period presets to pick your own date
+range within the past 90 days. Custom ranges are not remembered; Usage reopens on the last preset.
+
 If recent work is missing or a new model shows no cost, refresh to rescan session history and
 update model pricing.
 
