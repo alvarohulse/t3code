@@ -20,6 +20,7 @@ import {
   formatUsageContractMismatch,
   formatUsd,
   makeWindow,
+  type UsageWindowDays,
 } from "@t3tools/shared/usageFormat";
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, RefreshControl, View } from "react-native";
@@ -57,6 +58,7 @@ const WINDOW_OPTIONS = [
   { value: 7, label: "7d", accessibilityLabel: "Past 7 days" },
   { value: 30, label: "30d", accessibilityLabel: "Past 30 days" },
   { value: 90, label: "90d", accessibilityLabel: "Past 90 days" },
+  { value: "monthToDate", label: "MTD", accessibilityLabel: "Month to date" },
 ] as const;
 
 const METRIC_OPTIONS = [
@@ -89,7 +91,10 @@ export function UsageRouteScreen() {
   }
   const { tab } = selection;
   const setTab = (tab: UsageTab) => setSelection({ params: route.params, tab });
-  const [windowSelection, setWindowSelection] = useState(() => ({
+  const [windowSelection, setWindowSelection] = useState<{
+    readonly days: UsageWindowDays;
+    readonly window: ReturnType<typeof makeWindow>;
+  }>(() => ({
     days: 30,
     window: makeWindow(30),
   }));
@@ -153,7 +158,7 @@ export function UsageRouteScreen() {
   const [refreshingUsage, setRefreshingUsage] = useState(false);
   const refreshingRef = useRef(false);
   const showingLimits = tab === "limits";
-  const selectWindow = (days: number) => {
+  const selectWindow = (days: UsageWindowDays) => {
     setWindowSelection({
       days,
       window: makeWindow(days, undefined, days === 1 ? "hour" : "day"),

@@ -128,7 +128,8 @@ requires Android 12L or later.
 
 On web and desktop, open Usage from the command palette. While on Usage,
 press `C`, `T`, or `L` for Cost, Tokens, or Limits while not typing in a field.
-Use `Ctrl+Shift+1/2/3/4` (`Cmd+Shift+1/2/3/4` on macOS) for the past
-24 hours, 7 days, 30 days, or 90 days. Period shortcuts do nothing on Limits.
+Use `Ctrl+Shift+1/2/3/4/5` (`Cmd+Shift+1/2/3/4/5` on macOS) for the past
+24 hours, 7 days, 30 days, 90 days, or month to date. Month to date starts on the first of the
+current month in your time zone. Period shortcuts do nothing on Limits.
 Press `Escape` to return to the previous page. Customize these shortcuts in
 **Settings → Keybindings**.

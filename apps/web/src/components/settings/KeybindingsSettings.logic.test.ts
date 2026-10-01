@@ -55,6 +55,7 @@ describe("KeybindingsSettings.logic", () => {
       "usage.period.week",
       "usage.period.month",
       "usage.period.quarter",
+      "usage.period.monthToDate",
       "usage.open",
     ];
     const bindings = DEFAULT_RESOLVED_KEYBINDINGS.toReversed();

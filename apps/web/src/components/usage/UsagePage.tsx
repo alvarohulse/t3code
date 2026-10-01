@@ -97,8 +97,8 @@ function isUsageMetric(value: string | null | undefined): value is UsageMetric {
   return METRIC_OPTIONS.some((option) => option.value === value);
 }
 
-function isUsageWindowDays(value: number): value is UsagePagePreferences["windowDays"] {
-  return WINDOW_OPTIONS.some((option) => option.days === value);
+function parseUsageWindowDays(value: string): UsagePagePreferences["windowDays"] | undefined {
+  return WINDOW_OPTIONS.find((option) => String(option.days) === value)?.days;
 }
 
 export function UsagePage() {
@@ -195,8 +195,7 @@ export function UsagePage() {
   );
   const timeValueColumnWidth = `${60 / (activeProviders.length + 2)}%`;
 
-  const selectWindow = (days: number) => {
-    if (!isUsageWindowDays(days)) return;
+  const selectWindow = (days: UsagePagePreferences["windowDays"]) => {
     const nextPreferences = { metric, windowDays: days };
     setPreferences(nextPreferences);
     saveUsagePagePreferences(nextPreferences);
@@ -354,8 +353,8 @@ export function UsagePage() {
           value={[String(windowDays)]}
           disabled={showingLimits}
           onValueChange={(next) => {
-            const value = next[0];
-            if (value) selectWindow(Number(value));
+            const days = next[0] === undefined ? undefined : parseUsageWindowDays(next[0]);
+            if (days !== undefined) selectWindow(days);
           }}
         >
           {WINDOW_OPTIONS.map((option) => (
@@ -403,7 +402,10 @@ export function UsagePage() {
         <Select
           value={String(windowDays)}
           disabled={showingLimits}
-          onValueChange={(value) => selectWindow(Number(value))}
+          onValueChange={(value) => {
+            const days = value === null ? undefined : parseUsageWindowDays(value);
+            if (days !== undefined) selectWindow(days);
+          }}
         >
           <SelectTrigger
             aria-label="Usage period"

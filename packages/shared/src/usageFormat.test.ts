@@ -91,6 +91,29 @@ describe("hourly usage formatting", () => {
     expect(window.untilTime).toBe("2026-08-11T12:37:00.000Z");
   });
 
+  it("starts month to date on the first of the viewer's current month", () => {
+    const resolved = new Intl.DateTimeFormat().resolvedOptions();
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ ...resolved, timeZone: "America/Belize" });
+
+    try {
+      // 03:00Z on Oct 1 is still Sep 30 in Belize.
+      const lateSeptember = makeWindow("monthToDate", new Date("2026-10-01T03:00:00.000Z"));
+      expect([lateSeptember.sinceDay, lateSeptember.untilDay]).toEqual([
+        "2026-09-01",
+        "2026-09-30",
+      ]);
+      const firstOfOctober = makeWindow("monthToDate", new Date("2026-10-01T12:00:00.000Z"));
+      expect([firstOfOctober.sinceDay, firstOfOctober.untilDay]).toEqual([
+        "2026-10-01",
+        "2026-10-01",
+      ]);
+    } finally {
+      resolvedOptions.mockRestore();
+    }
+  });
+
   it("degrades an unknown resolved zone to UTC instead of crashing", () => {
     const resolved = new Intl.DateTimeFormat().resolvedOptions();
     const resolvedOptions = vi
