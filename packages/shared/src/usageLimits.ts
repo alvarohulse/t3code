@@ -138,17 +138,26 @@ export function collectExternalUsageLinks(presentations: LimitPresentations) {
   return [...links.values()];
 }
 
-/** Prefer the reported email; use an identical credential when no email is available. */
+/** Every identity that names the account: the reported email first, then the read's own identity. */
+function accountKeys(
+  driver: ServerProvider["driver"],
+  email: string | undefined,
+  limits?: ServerProviderUsageLimits,
+): string[] {
+  const keys: string[] = [];
+  const normalizedEmail = email?.trim().toLowerCase();
+  if (normalizedEmail) keys.push(`${driver}:${normalizedEmail}`);
+  if (limits?.credentialFingerprint)
+    keys.push(`${driver}:credential:${limits.credentialFingerprint}`);
+  return keys;
+}
+
 function accountKey(
   driver: ServerProvider["driver"],
   email: string | undefined,
   limits?: ServerProviderUsageLimits,
 ): string | null {
-  const normalizedEmail = email?.trim().toLowerCase();
-  if (normalizedEmail) return `${driver}:${normalizedEmail}`;
-  return limits?.credentialFingerprint
-    ? `${driver}:credential:${limits.credentialFingerprint}`
-    : null;
+  return accountKeys(driver, email, limits)[0] ?? null;
 }
 
 /**
@@ -189,6 +198,17 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const accounts = new Map<string, LimitAccount>();
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
+  // A CLI can drop its email between checks while the limits read still names
+  // the account, so either identity joins a report to an account seen before.
+  const aliases = new Map<string, string>();
+  const resolveKey = (identities: readonly string[], fallback: string) => {
+    const key =
+      identities.map((identity) => aliases.get(identity)).find((known) => known !== undefined) ??
+      identities[0] ??
+      fallback;
+    for (const identity of identities) if (!aliases.has(identity)) aliases.set(identity, key);
+    return key;
+  };
   const merge = (key: string, next: LimitAccount) => {
     // Redeeming through a hub also clears the routing cooldown that hub holds
     // for the account. Redeeming natively against the same subscription resets
@@ -253,8 +273,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (!provider.usageLimits || limitsNotice(provider.usageLimits) !== null) continue;
       merge(
-        accountKey(provider.driver, provider.auth.email, provider.usageLimits) ??
+        resolveKey(
+          accountKeys(provider.driver, provider.auth.email, provider.usageLimits),
           `${environmentId}:${provider.instanceId}`,
+        ),
         {
           key: `${environmentId}:${provider.instanceId}`,
           driver: provider.driver,
@@ -282,8 +304,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       for (const account of source.accounts) {
         if (limitsNotice(account.usageLimits) !== null) continue;
         merge(
-          accountKey(account.driver, account.email, account.usageLimits) ??
+          resolveKey(
+            accountKeys(account.driver, account.email, account.usageLimits),
             `${source.id}:${account.id}`,
+          ),
           {
             key: `${source.id}:${account.id}`,
             driver: account.driver,

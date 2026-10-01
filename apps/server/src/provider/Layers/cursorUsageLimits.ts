@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 import type { CursorSettings, ServerProviderUsageWindow } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -106,6 +107,20 @@ export function cursorUsageResponseToLimits(
   return windows.length > 0
     ? makeUsageLimits({ checkedAt, windows })
     : makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
+}
+
+/** The account id inside a Cursor access token, which is the same for every login of one account. */
+function cursorTokenSubject(token: string): string | null {
+  try {
+    const payload: unknown = JSON.parse(
+      Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"),
+    );
+    const subject =
+      typeof payload === "object" && payload !== null && "sub" in payload ? payload.sub : null;
+    return typeof subject === "string" && subject ? subject : null;
+  } catch {
+    return null;
+  }
 }
 
 export const readCursorUsageLimits = Effect.fn("readCursorUsageLimits")(function* (
@@ -241,7 +256,15 @@ export const readCursorUsageLimits = Effect.fn("readCursorUsageLimits")(function
         limitDollars: limit.perUserMonthlyLimitDollars ?? 0,
       });
     }).pipe(Effect.orElseSucceed(() => undefined));
-    return cursorUsageResponseToLimits(body, checkedAt, spendLimit);
+    const limits = cursorUsageResponseToLimits(body, checkedAt, spendLimit);
+    const accountId = cursorTokenSubject(token);
+    // Matches the account across environments even when one CLI reports no email.
+    return accountId && limits.unavailable === undefined
+      ? {
+          ...limits,
+          credentialFingerprint: NodeCrypto.createHash("sha256").update(accountId).digest("hex"),
+        }
+      : limits;
   }).pipe(
     Effect.timeout("10 seconds"),
     Effect.orElseSucceed(() =>
