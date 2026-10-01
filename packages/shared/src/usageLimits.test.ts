@@ -277,6 +277,36 @@ describe("pools", () => {
     expect(collectLimitAccounts(input)).toHaveLength(1);
   });
 
+  it("keeps one Cursor account when one environment's CLI stops reporting the email", () => {
+    const spendLimit = {
+      id: "spendLimit",
+      kind: "monthly",
+      label: "Spend limit",
+      usedPercent: 1,
+      spend: { usedUsd: 34, limitUsd: 5000 },
+    } as const;
+    const cursor = provider({
+      driver: ProviderDriverKind.make("cursor"),
+      instanceId: ProviderInstanceId.make("cursor"),
+      auth: { status: "authenticated", email: "same@example.com" },
+      usageLimits: { checkedAt, credentialFingerprint: "cursor-account", windows: [spendLimit] },
+    });
+    const signedOut = { ...cursor, auth: { status: "unauthenticated" as const } };
+    const accounts = collectLimitAccounts(
+      new Map([
+        [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [cursor] } }],
+        [
+          EnvironmentId.make("env-b"),
+          { entry: { target: { label: "Desktop" } }, serverConfig: { providers: [signedOut] } },
+        ],
+      ]),
+    );
+    expect(accounts).toHaveLength(1);
+    expect(
+      billedSpendByUsageProvider(collectLimitPools(accounts, now)).get("cursor")?.spend,
+    ).toEqual({ usedUsd: 34, limitUsd: 5000 });
+  });
+
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
     const native = provider({
       driver: claude,
