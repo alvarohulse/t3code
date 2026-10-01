@@ -17,14 +17,20 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 
 import { GUARD_LENGTH, type TranscriptParsePosition } from "./usageTranscriptReader.ts";
-import type { CodexScanState, UsageRecord } from "./usageTranscripts.ts";
+import {
+  isLargerUsageSnapshot,
+  type CodexScanState,
+  type UsageRecord,
+} from "./usageTranscripts.ts";
 
 // v2: Codex fork-copy suppression changed what a file parses to, so v1
 // entries would keep serving double-counted records forever.
 // v3: entries carry the parse position and reducer state so a grown file
 // re-parses only its appended bytes instead of starting over.
 // v4: records carry Claude fast mode, which v3 rows never captured.
-const USAGE_SCAN_CACHE_VERSION = 4 as const;
+// v5: records carry Claude 1-hour cache writes, and within-file dedupe keeps
+// the largest usage snapshot, so v4 rows would keep partial output counts.
+const USAGE_SCAN_CACHE_VERSION = 5 as const;
 
 export interface CachedFile {
   readonly size: number;
@@ -60,6 +66,7 @@ type SerializedRecord = readonly [
   dedupeKey: string | null,
   reportedCostUsd: number | null,
   fast: 0 | 1,
+  cacheCreation1hTokens: number,
 ];
 
 interface SerializedFile {
@@ -112,6 +119,7 @@ export function encodeScanCache(cache: ScanCache): SerializedCache {
     record.dedupeKey,
     record.reportedCostUsd,
     record.fast ? 1 : 0,
+    record.cacheCreation1hTokens ?? 0,
   ];
 
   const files: Record<string, SerializedFile> = {};
@@ -168,7 +176,7 @@ export function decodeScanCache(document: unknown): ScanCache {
   ): UsageRecord[] | null => {
     const records: UsageRecord[] = [];
     for (const row of rows) {
-      if (!isRecordArray(row) || row.length < 11) return null;
+      if (!isRecordArray(row) || row.length < 12) return null;
       const [
         timestampMs,
         modelIndex,
@@ -181,6 +189,7 @@ export function decodeScanCache(document: unknown): ScanCache {
         dedupeKey,
         reportedCostUsd,
         fast,
+        cacheCreation1h,
       ] = row as SerializedRecord;
 
       const model = typeof modelIndex === "number" ? models[modelIndex] : undefined;
@@ -193,7 +202,8 @@ export function decodeScanCache(document: unknown): ScanCache {
         !Number.isFinite(cacheCreation) ||
         !Number.isFinite(output) ||
         !Number.isFinite(reasoning) ||
-        (fast !== 0 && fast !== 1)
+        (fast !== 0 && fast !== 1) ||
+        !Number.isFinite(cacheCreation1h)
       ) {
         return null;
       }
@@ -210,6 +220,7 @@ export function decodeScanCache(document: unknown): ScanCache {
           outputTokens: output,
           reasoningTokens: reasoning,
         },
+        ...(cacheCreation1h > 0 ? { cacheCreation1hTokens: cacheCreation1h } : {}),
         reportedCostUsd: typeof reportedCostUsd === "number" ? reportedCostUsd : null,
         fast: fast === 1,
         dedupeKey: typeof dedupeKey === "string" ? dedupeKey : null,
@@ -313,21 +324,31 @@ export function pruneScanCache(cache: ScanCache, retentionCutoffMs: number): num
 /**
  * Within-file de-duplication, applied before an entry is cached.
  *
- * Callers stitching an incremental parse together pass one `seen` set across
- * the line and tail record batches so the whole file stays deduplicated as a
- * unit; the set is mutated in place.
+ * The line and tail batches are deduplicated as one unit. Each key keeps the
+ * position of its first record and the contents of its largest snapshot, so a
+ * complete snapshot in the tail still replaces a partial one in `records`.
  */
 export function dedupeWithinFile(
   records: readonly UsageRecord[],
-  seen: Set<string> = new Set(),
-): readonly UsageRecord[] {
-  const kept: UsageRecord[] = [];
-  for (const record of records) {
+  tailRecords: readonly UsageRecord[] = [],
+): { readonly records: readonly UsageRecord[]; readonly tailRecords: readonly UsageRecord[] } {
+  const keptRecords: UsageRecord[] = [];
+  const keptTail: UsageRecord[] = [];
+  const positions = new Map<string, { readonly batch: UsageRecord[]; readonly index: number }>();
+  const keep = (batch: UsageRecord[], record: UsageRecord) => {
     if (record.dedupeKey !== null) {
-      if (seen.has(record.dedupeKey)) continue;
-      seen.add(record.dedupeKey);
+      const position = positions.get(record.dedupeKey);
+      if (position !== undefined) {
+        if (isLargerUsageSnapshot(record, position.batch[position.index]!)) {
+          position.batch[position.index] = record;
+        }
+        return;
+      }
+      positions.set(record.dedupeKey, { batch, index: batch.length });
     }
-    kept.push(record);
-  }
-  return kept;
+    batch.push(record);
+  };
+  for (const record of records) keep(keptRecords, record);
+  for (const record of tailRecords) keep(keptTail, record);
+  return { records: keptRecords, tailRecords: keptTail };
 }

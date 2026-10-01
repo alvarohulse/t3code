@@ -19,7 +19,9 @@ import {
   collectExternalUsageLinks,
   collectLimitNotices,
   collectLimitPools,
+  billedSpendByUsageProvider,
   displayLimitWindows,
+  formatSpendLeft,
   elapsedShare,
   formatResetsIn,
   limitsNotice,
@@ -273,6 +275,36 @@ describe("pools", () => {
       },
     });
     expect(collectLimitAccounts(input)).toHaveLength(1);
+  });
+
+  it("keeps one Cursor account when one environment's CLI stops reporting the email", () => {
+    const spendLimit = {
+      id: "spendLimit",
+      kind: "monthly",
+      label: "Spend limit",
+      usedPercent: 1,
+      spend: { usedUsd: 34, limitUsd: 5000 },
+    } as const;
+    const cursor = provider({
+      driver: ProviderDriverKind.make("cursor"),
+      instanceId: ProviderInstanceId.make("cursor"),
+      auth: { status: "authenticated", email: "same@example.com" },
+      usageLimits: { checkedAt, credentialFingerprint: "cursor-account", windows: [spendLimit] },
+    });
+    const signedOut = { ...cursor, auth: { status: "unauthenticated" as const } };
+    const accounts = collectLimitAccounts(
+      new Map([
+        [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [cursor] } }],
+        [
+          EnvironmentId.make("env-b"),
+          { entry: { target: { label: "Desktop" } }, serverConfig: { providers: [signedOut] } },
+        ],
+      ]),
+    );
+    expect(accounts).toHaveLength(1);
+    expect(
+      billedSpendByUsageProvider(collectLimitPools(accounts, now)).get("cursor")?.spend,
+    ).toEqual({ usedUsd: 34, limitUsd: 5000 });
   });
 
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
@@ -715,6 +747,25 @@ describe("pooled account columns", () => {
     expect(pool!.windows[1]!.resets.map((reset) => reset.member.account.key)).toEqual(["a", "b"]);
     expect(pool!.windows[1]!.remainingPercent).toBe(50);
     expect(keys(collectLimitPools(accounts.toReversed(), now)[0]!)).toEqual(keys(pool!));
+  });
+
+  it("sums billed dollars across accounts only when every account reports them", () => {
+    const credits = {
+      id: "extra_usage",
+      kind: "monthly",
+      label: "Usage credits",
+    } as const;
+    const billed = [
+      account("a", [{ ...credits, usedPercent: 50, spend: { usedUsd: 3000, limitUsd: 6000 } }]),
+      account("b", [{ ...credits, usedPercent: 25, spend: { usedUsd: 1000, limitUsd: 4000 } }]),
+    ];
+    const pools = collectLimitPools(billed, now);
+    const spend = billedSpendByUsageProvider(pools).get("claude")?.spend;
+    expect(spend).toEqual({ usedUsd: 4000, limitUsd: 10000 });
+    expect(formatSpendLeft(spend!)).toBe("$6,000 left of $10,000");
+
+    const partial = [...billed, account("c", [{ ...credits, usedPercent: 90 }])];
+    expect(billedSpendByUsageProvider(collectLimitPools(partial, now)).size).toBe(0);
   });
 
   it("preserves gaps without counting missing windows toward pooled quota", () => {

@@ -65,12 +65,40 @@ function boundaryOverlap(previous: readonly string[], current: readonly string[]
   return lengths.at(-1) ?? 0;
 }
 
+const CURSOR_API = "https://api2.cursor.sh";
+
+/**
+ * Where the Cursor CLI's credential lives: a saved `auth.json` login path, the
+ * macOS Keychain login, `CURSOR_API_KEY`, or `CURSOR_AUTH_TOKEN`.
+ */
+export type CursorCredentialSource =
+  | string
+  | { readonly kind: "keychain" }
+  | { readonly kind: "apiKey"; readonly apiKey: string }
+  | { readonly kind: "accessToken"; readonly accessToken: string };
+
+type CursorRequest = (url: string, init: RequestInit) => Promise<Response>;
+
+/** Exchanges a `CURSOR_API_KEY` for the access token of the account it names. */
+async function exchangeCursorApiKey(apiKey: string, request: CursorRequest): Promise<unknown> {
+  const response = await request(`${CURSOR_API}/auth/exchange_user_api_key`, {
+    method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: "{}",
+  });
+  if (response.status === 401 || response.status === 403) return null;
+  if (!response.ok) throw new Error("Cursor API key exchange failed");
+  return object(await response.json()).accessToken;
+}
+
 /** Dashboard usage includes headless agents and reports fresh input separately from cache reads. */
 export async function readCursorAccountUsage(
-  credentialSource: string | { readonly kind: "keychain" },
+  credentialSource: CursorCredentialSource,
   sinceMs: number,
   endDate: number,
-  request: (url: string, init: RequestInit) => Promise<Response> = globalThis.fetch,
+  request: CursorRequest = globalThis.fetch,
   keychainToken: () => Promise<string | null> = readMacCursorAccessToken,
 ): Promise<CursorAccountUsageReadResult> {
   let accessToken: unknown;
@@ -78,7 +106,11 @@ export async function readCursorAccountUsage(
     accessToken =
       typeof credentialSource === "string"
         ? object(JSON.parse(await NodeFSP.readFile(credentialSource, "utf8"))).accessToken
-        : await keychainToken();
+        : credentialSource.kind === "keychain"
+          ? await keychainToken()
+          : credentialSource.kind === "apiKey"
+            ? await exchangeCursorApiKey(credentialSource.apiKey, request)
+            : credentialSource.accessToken;
   } catch (cause) {
     const missing = typeof credentialSource === "string" && object(cause).code === "ENOENT";
     return {
@@ -89,9 +121,11 @@ export async function readCursorAccountUsage(
         ? null
         : typeof credentialSource === "string"
           ? "Cursor credentials could not be read."
-          : cause instanceof CursorKeychainTimeoutError
-            ? "Allow Keychain access on the Mac running T3 Code, then refresh."
-            : "Cursor Keychain credentials could not be read.",
+          : credentialSource.kind === "apiKey"
+            ? "Cursor account usage could not be read."
+            : cause instanceof CursorKeychainTimeoutError
+              ? "Allow Keychain access on the Mac running T3 Code, then refresh."
+              : "Cursor Keychain credentials could not be read.",
     };
   }
   if (typeof accessToken !== "string" || !accessToken) {
@@ -102,7 +136,11 @@ export async function readCursorAccountUsage(
       error:
         typeof credentialSource === "string"
           ? null
-          : "Cursor account history needs a macOS Keychain CLI login on this server.",
+          : credentialSource.kind === "apiKey"
+            ? "Cursor rejected CURSOR_API_KEY on this server."
+            : credentialSource.kind === "accessToken"
+              ? "Cursor rejected CURSOR_AUTH_TOKEN on this server."
+              : "Cursor account history needs a macOS Keychain CLI login on this server.",
     };
   }
   let accountKey: string | null = null;
@@ -112,8 +150,6 @@ export async function readCursorAccountUsage(
       JSON.parse(Buffer.from(payload ?? "", "base64url").toString("utf8")),
     ).sub;
     if (typeof subject !== "string" || !subject) throw new Error("Invalid authentication");
-    const userId = subject.split("|").at(-1);
-    if (!userId) throw new Error("Invalid authentication");
     accountKey = accountHash(subject);
     if (!Number.isFinite(sinceMs) || !Number.isFinite(endDate) || sinceMs < 0 || sinceMs > endDate)
       throw new Error("Invalid date window");
@@ -130,22 +166,27 @@ export async function readCursorAccountUsage(
       if (page > (total === undefined ? 1000 : Math.ceil(total / pageSize) * 2 + 1)) {
         throw new Error("Account usage page limit exceeded");
       }
-      const response = await request("https://cursor.com/api/dashboard/get-filtered-usage-events", {
-        method: "POST",
-        redirect: "error",
-        signal: AbortSignal.any([deadline, AbortSignal.timeout(10_000)]),
-        headers: {
-          "Content-Type": "application/json",
-          Origin: "https://cursor.com",
-          Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${accessToken}`)}`,
+      // The Bearer RPC accepts every CLI credential. The cursor.com dashboard
+      // route only accepts saved logins, not tokens exchanged from an API key.
+      const response = await request(
+        `${CURSOR_API}/aiserver.v1.DashboardService/GetFilteredUsageEvents`,
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.any([deadline, AbortSignal.timeout(10_000)]),
+          headers: {
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            page,
+            pageSize,
+            startDate: String(sinceMs),
+            endDate: String(endDate),
+          }),
         },
-        body: JSON.stringify({
-          page,
-          pageSize,
-          startDate: String(sinceMs),
-          endDate: String(endDate),
-        }),
-      });
+      );
       if (response.status === 401 || response.status === 403) {
         return {
           accountKey,
@@ -217,6 +258,13 @@ export async function readCursorAccountUsage(
             throw new Error("Invalid account usage totals");
           }
         }
+        const tokenFeeCents = event.cursorTokenFee ?? 0;
+        if (
+          typeof tokenFeeCents !== "number" ||
+          !Number.isFinite(tokenFeeCents) ||
+          tokenFeeCents < 0
+        )
+          throw new Error("Invalid account usage totals");
         const timestampMs =
           typeof event.timestamp === "string" && event.timestamp.trim() !== ""
             ? Number(event.timestamp)
@@ -236,8 +284,11 @@ export async function readCursorAccountUsage(
           outputTokens: tokens(usage.outputTokens),
           reasoningTokens: 0,
         };
+        // `totalCents` is the model's list price and Cursor bills its token fee
+        // on top. `chargedCents` is billing state, not price: free-credit
+        // events report 0 there.
         const reportedCostUsd =
-          typeof usage.totalCents === "number" ? usage.totalCents / 100 : null;
+          typeof usage.totalCents === "number" ? (usage.totalCents + tokenFeeCents) / 100 : null;
         const sessionId = typeof event.conversationId === "string" ? event.conversationId : "";
         // No event ID is provided. Preserve identical billed rows with an occurrence index.
         const key = accountHash(

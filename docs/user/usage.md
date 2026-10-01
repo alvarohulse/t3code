@@ -8,7 +8,9 @@ desktop when the terminal is not focused. Customize `usage.open` in
 
 **Usage** combines Codex, Claude Code, Grok Build, OpenCode, Antigravity, and Cursor history from your connected
 environments. It shows token use, cache savings, model breakdowns, and estimated API-equivalent
-cost. These estimates are not your subscription bill.
+cost. These estimates are not your subscription bill. When a provider bills you in dollars, such
+as a Cursor team spend limit or Claude usage credits, its row also shows what the provider has
+billed for its own billing period, which may not match the selected date range.
 
 Totals depend on the history available on each server. Grok turns without a saved completed-turn
 record are missing from the totals.
@@ -17,9 +19,10 @@ OpenCode reads its SQLite database and older JSON history. Antigravity reads loc
 databases, including T3-managed profiles. Set `OPENCODE_DATA_DIR` or `ANTIGRAVITY_DATA_DIR` on the
 server to read a different data directory; comma-separated paths read multiple directories.
 
-Cursor reads account usage from Cursor's dashboard API using the CLI login saved on the server.
+Cursor reads account usage from Cursor's dashboard API using the server's `CURSOR_AUTH_TOKEN`,
+`CURSOR_API_KEY`, or saved CLI login, in that order. Cursor costs include Cursor's token fee.
 This includes headless T3 sessions and desktop usage across machines; the same account counts
-once across connected environments. Without an accessible CLI login, T3 shows a
+once across connected environments. Without an accessible Cursor credential, T3 shows a
 notice instead of incomplete local totals. T3 does not estimate missing tokens from conversation text.
 On macOS, choose **Enable Cursor usage** on Usage to allow T3 to read your existing CLI login
 from Keychain. You can turn it off in **Settings → Providers → Usage providers**. macOS may ask
@@ -96,10 +99,14 @@ anything. The command is offered only for providers that appear under **Usage �
 OpenCode Go reports its session, weekly, and monthly allowance when OpenCode runs locally in
 the environment. T3 cannot report limits for external OpenCode servers because their credentials
 belong to the remote server. Cursor reports
-its monthly allowance, including separate Auto and API usage, using the CLI login or
-`CURSOR_AUTH_TOKEN`. On macOS, this includes the default Keychain login after you enable Cursor
+its monthly allowance, including separate Auto and API usage, using `CURSOR_AUTH_TOKEN`,
+`CURSOR_API_KEY`, or the CLI login. On macOS, this includes the default Keychain login after you enable Cursor
 usage. Keychain login is used for limits only with Cursor's default API endpoint. If you configure
 a custom Cursor endpoint, use an explicit token or file-based CLI login for limits.
+
+Metered accounts show their dollar budget as a Limits bar. On Cursor team plans billed per use, that
+is your own spend against your per-user limit for the billing cycle. On Claude, it is usage credits
+against the monthly limit; Claude does not report when that period resets.
 
 Grok reports the remaining subscription allowance and reset time for its current billing period
 after signing in with `grok login`. Explicit `XAI_API_KEY` connections and custom authentication

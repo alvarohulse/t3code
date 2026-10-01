@@ -1,5 +1,12 @@
 import { ChatGptUsageButton } from "../settings/ChatGptUsageButton";
-import { usesChatGptSharing } from "@t3tools/shared/usageLimits";
+import {
+  billedSpendByUsageProvider,
+  collectLimitAccounts,
+  collectLimitPools,
+  formatResetsIn,
+  formatSpendUsed,
+  usesChatGptSharing,
+} from "@t3tools/shared/usageLimits";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -145,6 +152,22 @@ export function UsagePage() {
   );
   const presentations = useAtomValue(environmentPresentations.presentationsAtom);
   const cursorAccessEnvironments = cursorKeychainAccessEnvironments(selectedEnvironments);
+  // What metered providers bill for their own period, from the same limits
+  // snapshots as the Limits tab; the estimate below covers the page's range.
+  const billedSpend = useMemo(
+    () =>
+      billedSpendByUsageProvider(
+        collectLimitPools(
+          collectLimitAccounts(
+            selectedEnvironmentIds === null
+              ? presentations
+              : new Map([...presentations].filter(([id]) => selectedEnvironmentIds.has(id))),
+          ),
+          limitsNow,
+        ),
+      ),
+    [presentations, selectedEnvironmentIds, limitsNow],
+  );
   const sourceMessages = [
     ...new Set(
       selectedEnvironments.flatMap(
@@ -579,6 +602,10 @@ export function UsagePage() {
                       const totals = merged.providers.find((entry) => entry.provider === provider);
                       const share =
                         metric === "cost" ? (totals?.costShare ?? 0) : (totals?.tokenShare ?? 0);
+                      const billed = billedSpend.get(provider);
+                      const billedResets = billed?.members[0]
+                        ? formatResetsIn(billed.members[0].window, limitsNow)
+                        : null;
                       const providerSessions = totals?.sessions ?? 0;
                       const sessionLabel = `${formatCount(providerSessions)} ${
                         providerSessions === 1 ? "session" : "sessions"
@@ -615,6 +642,12 @@ export function UsagePage() {
                               ? `${formatPercent(share)} of cost · ${formatTokens(totals?.totalTokens ?? 0)} tokens`
                               : `${formatPercent(share)} of tokens · ${formatUsd(totals?.costUsd ?? 0)}`}
                           </span>
+                          {metric === "cost" && billed ? (
+                            <span className="text-xs text-foreground tabular-nums">
+                              {formatSpendUsed(billed.spend)} billed this period
+                              {billedResets ? ` · ${billedResets}` : ""}
+                            </span>
+                          ) : null}
                         </div>
                       );
                     })}

@@ -24,6 +24,17 @@ export const ServerProviderUsageWindow = Schema.Struct({
   usedPercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
   resetsAt: Schema.optional(IsoDateTime),
   windowDurationMins: Schema.optional(NonNegativeInt),
+  /**
+   * The dollar budget behind a metered window, as the provider bills it
+   * (Cursor's spend limit, Claude's usage credits). `usedPercent` stays the
+   * share of `limitUsd`, so clients that ignore this still draw the bar.
+   */
+  spend: Schema.optional(
+    Schema.Struct({
+      usedUsd: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+      limitUsd: Schema.Number.check(Schema.isGreaterThan(0)),
+    }),
+  ),
 });
 export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 
@@ -50,7 +61,7 @@ export type ServerProviderResetCredits = typeof ServerProviderResetCredits.Type;
 export const ServerProviderUsageLimits = Schema.Struct({
   checkedAt: IsoDateTime,
   windows: ForwardCompatibleArray(ServerProviderUsageWindow),
-  /** Opaque credential identity when the provider does not report an account. */
+  /** Opaque account identity that matches across environments, even when no email is reported. */
   credentialFingerprint: Schema.optional(TrimmedNonEmptyString),
   resetCredits: Schema.optional(ServerProviderResetCredits),
   /** Provider-owned usage settings when quota windows are not available to the client. */

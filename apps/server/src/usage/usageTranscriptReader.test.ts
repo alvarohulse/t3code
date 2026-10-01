@@ -245,7 +245,7 @@ describe("SQLite usage readers", () => {
       0,
       1781000000000,
       async (_url, init) => {
-        assert.include(new Headers(init.headers).get("cookie") ?? "", "demo%3A%3A");
+        assert.strictEqual(new Headers(init.headers).get("authorization"), `Bearer ${accessToken}`);
         return Response.json({ totalUsageEventsCount: 0, usageEventsDisplay: [] });
       },
       async () => {
@@ -266,11 +266,13 @@ describe("SQLite usage readers", () => {
     const pages: number[] = [];
     const signals: AbortSignal[] = [];
     const request = async (url: string, init: RequestInit) => {
-      assert.strictEqual(String(url), "https://cursor.com/api/dashboard/get-filtered-usage-events");
+      assert.strictEqual(
+        String(url),
+        "https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents",
+      );
       assert.strictEqual(init?.redirect, "error");
       const headers = new Headers(init?.headers);
-      assert.strictEqual(headers.get("origin"), "https://cursor.com");
-      assert.include(headers.get("cookie") ?? "", "WorkosCursorSessionToken=demo%3A%3A");
+      assert.strictEqual(headers.get("authorization"), `Bearer ${accessToken}`);
       const body = JSON.parse(String(init?.body));
       pages.push(body.page);
       if (init.signal) signals.push(init.signal);
@@ -282,6 +284,7 @@ describe("SQLite usage readers", () => {
           conversationId: `conversation-${body.page}`,
           isHeadless: body.page === 2,
           chargedCents: 0,
+          cursorTokenFee: 4,
           tokenUsage: {
             inputTokens: 10,
             outputTokens: 5,
@@ -306,8 +309,60 @@ describe("SQLite usage readers", () => {
       outputTokens: 5,
       reasoningTokens: 0,
     });
-    assert.strictEqual(result.records[0]?.reportedCostUsd, 0.25);
+    // Model list price plus Cursor's token fee, even when nothing was charged.
+    assert.strictEqual(result.records[0]?.reportedCostUsd, 0.29);
     assert.isFalse(result.accountKey?.includes("demo") ?? true);
+  });
+
+  it("reads Cursor account history for the account a CURSOR_API_KEY names", async () => {
+    const accessToken = `header.${Buffer.from(JSON.stringify({ sub: "auth|demo" })).toString("base64url")}.signature`;
+    const urls: string[] = [];
+    const request = async (url: string, init: RequestInit) => {
+      urls.push(String(url));
+      const authorization = new Headers(init.headers).get("authorization");
+      if (String(url).endsWith("/auth/exchange_user_api_key")) {
+        assert.strictEqual(authorization, "Bearer key_demo");
+        return Response.json({ accessToken, refreshToken: "unused" });
+      }
+      assert.strictEqual(authorization, `Bearer ${accessToken}`);
+      return Response.json({
+        totalUsageEventsCount: 1,
+        usageEventsDisplay: [
+          {
+            timestamp: "1780000000000",
+            model: "gpt-5",
+            tokenUsage: { inputTokens: 10, outputTokens: 5, totalCents: 1 },
+          },
+        ],
+      });
+    };
+    const fromKey = await readCursorAccountUsage(
+      { kind: "apiKey", apiKey: "key_demo" },
+      0,
+      1781000000000,
+      request,
+    );
+    assert.isNull(fromKey.error);
+    assert.strictEqual(fromKey.records.length, 1);
+    assert.deepStrictEqual(urls, [
+      "https://api2.cursor.sh/auth/exchange_user_api_key",
+      "https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents",
+    ]);
+
+    // The same account read through a saved login shares one fingerprint.
+    const authPath = NodePath.join(dir, "auth.json");
+    await NodeFSP.writeFile(authPath, JSON.stringify({ accessToken }));
+    const fromLogin = await readCursorAccountUsage(authPath, 0, 1781000000000, request);
+    assert.strictEqual(fromLogin.accountKey, fromKey.accountKey);
+
+    const rejected = await readCursorAccountUsage(
+      { kind: "apiKey", apiKey: "key_revoked" },
+      0,
+      1781000000000,
+      async () => new Response("unauthorized", { status: 401 }),
+    );
+    assert.strictEqual(rejected.error, "Cursor rejected CURSOR_API_KEY on this server.");
+    assert.deepStrictEqual(rejected.records, []);
   });
 
   it("reads Cursor account history beyond 100 pages", async () => {

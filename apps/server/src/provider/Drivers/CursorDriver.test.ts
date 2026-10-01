@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "@effect/vitest";
@@ -128,12 +129,16 @@ it.layer(testLayer)("CursorDriver", (it) => {
           ),
         );
 
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        const payload = Buffer.from(JSON.stringify({ sub: "user_123" })).toString("base64url");
+        const accessToken = `header.${payload}.signature`;
+
         const instance = yield* CursorDriver.create({
           instanceId: ProviderInstanceId.make("cursor-flaky-login"),
           displayName: "Cursor test",
           enabled: true,
           environment: [
-            { name: "CURSOR_AUTH_TOKEN", value: "test-token", sensitive: true },
+            { name: "CURSOR_AUTH_TOKEN", value: accessToken, sensitive: true },
             { name: "HOME", value: tempDir, sensitive: false },
           ],
           config: { ...CursorDriver.defaultConfig(), binaryPath },
@@ -142,6 +147,10 @@ it.layer(testLayer)("CursorDriver", (it) => {
         const snapshot = yield* instance.snapshot.refresh;
         expect(snapshot.auth.status).toBe("unauthenticated");
         expect(snapshot.usageLimits?.windows[0]?.usedPercent).toBe(42);
+        // Without an email, the account id still matches other environments.
+        expect(snapshot.usageLimits?.credentialFingerprint).toBe(
+          NodeCrypto.createHash("sha256").update("user_123").digest("hex"),
+        );
       }).pipe(Effect.scoped),
   );
 });

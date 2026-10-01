@@ -10,6 +10,8 @@ import {
   displayLimitWindows,
   formatDuration,
   formatResetsIn,
+  formatSpendLeft,
+  formatSpendUsed,
   remainingPercent,
   type LimitAccount,
   type LimitPoolWindow,
@@ -110,6 +112,11 @@ function PoolWindowCard({
             </Text>
             <Text className="text-sm text-foreground-muted">left</Text>
           </View>
+          {pool.spend ? (
+            <Text className="text-xs tabular-nums text-foreground-muted">
+              {formatSpendLeft(pool.spend)}
+            </Text>
+          ) : null}
         </View>
         {pool.pace ? (
           <Text className="text-xs text-foreground-tertiary">{PACE_LABEL[pool.pace]}</Text>
@@ -388,6 +395,11 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
               <Text className="text-3xl font-t3-bold tabular-nums text-foreground">
                 {remainingPercent(window)}% left
               </Text>
+              {window.spend ? (
+                <Text selectable className="text-sm tabular-nums text-foreground-muted">
+                  {formatSpendUsed(window.spend)} billed
+                </Text>
+              ) : null}
               {window.resetsAt ? (
                 <Text selectable className="text-sm text-foreground-muted">
                   Resets{" "}

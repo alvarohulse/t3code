@@ -19,6 +19,12 @@ export interface UsageRecord {
   readonly rateModel?: string;
   readonly sessionId: string;
   readonly totals: UsageTokenTotals;
+  /**
+   * The part of `totals.cacheCreationTokens` written to the 1-hour cache, which
+   * bills at a higher rate than the default 5-minute cache. Only Claude Code
+   * records this.
+   */
+  readonly cacheCreation1hTokens?: number;
   readonly reportedCostUsd: number | null;
   /**
    * Whether the request ran in fast mode, which bills at a model-specific
@@ -71,6 +77,18 @@ export function totalTokens(totals: UsageTokenTotals): number {
 }
 
 /**
+ * Whether `candidate` is a more complete snapshot of the same request than
+ * `kept`. Records sharing a `dedupeKey` describe one request, and streaming
+ * writers can log partial output counts before the final one.
+ */
+export function isLargerUsageSnapshot(candidate: UsageRecord, kept: UsageRecord): boolean {
+  if (candidate.totals.outputTokens !== kept.totals.outputTokens) {
+    return candidate.totals.outputTokens > kept.totals.outputTokens;
+  }
+  return totalTokens(candidate.totals) > totalTokens(kept.totals);
+}
+
+/**
  * Cheap substring gate applied before `JSON.parse`.
  *
  * Transcripts are mostly tool output; only a minority of lines carry usage. On
@@ -101,10 +119,12 @@ function grokCostTicksToUsd(ticks: unknown): number | null {
 /**
  * Parses one line of a Claude Code transcript.
  *
- * T3 Code writes one record per assistant *content block*, and every one of
- * those records repeats the same complete `usage` object for the parent
- * message. Summing them overcounts by roughly 2.4x on a real workload, so the
- * caller must drop repeats by `dedupeKey` and keep the first.
+ * Claude Code writes one record per assistant *content block*, and every one
+ * of those records carries a `usage` object for the parent message. Summing
+ * them overcounts by roughly 2.4x on a real workload, so the caller must keep
+ * one record per `dedupeKey`. Some Claude Code versions log partial output
+ * counts on the early blocks, so the kept record must be the largest snapshot
+ * (`isLargerUsageSnapshot`), not the first.
  */
 export function parseClaudeLine(line: string): UsageRecord | null {
   let parsed: unknown;
@@ -144,6 +164,15 @@ export function parseClaudeRecord(parsed: unknown): UsageRecord | null {
     messageId === null && requestId === null ? null : `${messageId ?? ""}:${requestId ?? ""}`;
 
   const cost = record["costUSD"];
+  const cacheCreationTokens = int(usageRecord["cache_creation_input_tokens"]);
+  const cacheCreation = usageRecord["cache_creation"];
+  const cacheCreation1hTokens =
+    typeof cacheCreation === "object" && cacheCreation !== null
+      ? Math.min(
+          cacheCreationTokens,
+          int((cacheCreation as Record<string, unknown>)["ephemeral_1h_input_tokens"]),
+        )
+      : 0;
 
   return {
     provider: "claude",
@@ -153,11 +182,12 @@ export function parseClaudeRecord(parsed: unknown): UsageRecord | null {
     totals: {
       uncachedInputTokens: int(usageRecord["input_tokens"]),
       cachedInputTokens: int(usageRecord["cache_read_input_tokens"]),
-      cacheCreationTokens: int(usageRecord["cache_creation_input_tokens"]),
+      cacheCreationTokens,
       outputTokens: int(usageRecord["output_tokens"]),
       // Anthropic folds thinking tokens into output and does not break them out.
       reasoningTokens: 0,
     },
+    ...(cacheCreation1hTokens > 0 ? { cacheCreation1hTokens } : {}),
     reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) ? cost : null,
     fast: usageRecord["speed"] === "fast",
     dedupeKey,

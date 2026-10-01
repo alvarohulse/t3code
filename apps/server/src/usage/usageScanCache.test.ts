@@ -61,7 +61,15 @@ describe("scan cache round trip", () => {
       [
         "/a.jsonl",
         100,
-        [record(), record({ dedupeKey: "msg_2:", model: "claude-opus-5-5", fast: true })],
+        [
+          record(),
+          record({
+            dedupeKey: "msg_2:",
+            model: "claude-opus-5-5",
+            fast: true,
+            cacheCreation1hTokens: 8,
+          }),
+        ],
       ],
       ["/b.jsonl", 200, [record({ sessionId: "session-b", reportedCostUsd: 1.5 })]],
     ]);
@@ -133,7 +141,12 @@ describe("scan cache round trip", () => {
     const row = encoded.files["/a.jsonl"]!.r[0]!;
     const poisoned = {
       ...encoded,
-      files: { "/a.jsonl": { ...encoded.files["/a.jsonl"]!, r: [[...row.slice(0, 10), true]] } },
+      files: {
+        "/a.jsonl": {
+          ...encoded.files["/a.jsonl"]!,
+          r: [[...row.slice(0, 10), true, ...row.slice(11)]],
+        },
+      },
     };
 
     expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/a.jsonl")).toBe(false);
@@ -141,7 +154,7 @@ describe("scan cache round trip", () => {
 
   it("rejects a document from the previous cache version", () => {
     const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
-    const previous = { ...encoded, version: 3 };
+    const previous = { ...encoded, version: 4 };
 
     expect(decodeScanCache(JSON.parse(JSON.stringify(previous))).size).toBe(0);
   });
@@ -226,20 +239,31 @@ describe("pruneScanCache", () => {
 });
 
 describe("dedupeWithinFile", () => {
-  it("keeps the first record per dedupe key", () => {
-    const kept = dedupeWithinFile([
-      record({ totals: { ...record().totals, outputTokens: 1 } }),
-      record({ totals: { ...record().totals, outputTokens: 999 } }),
-      record({ dedupeKey: "msg_2:" }),
-    ]);
+  const output = (outputTokens: number, dedupeKey = "msg_1:") =>
+    record({ dedupeKey, totals: { ...record().totals, outputTokens } });
 
-    expect(kept).toHaveLength(2);
-    expect(kept[0]?.totals.outputTokens).toBe(1);
+  it("keeps the largest snapshot per dedupe key at its first position", () => {
+    const { records } = dedupeWithinFile([output(1), output(2, "msg_2:"), output(999), output(3)]);
+
+    expect(records.map((kept) => [kept.dedupeKey, kept.totals.outputTokens])).toEqual([
+      ["msg_1:", 999],
+      ["msg_2:", 2],
+    ]);
+  });
+
+  it("lets a complete snapshot in the tail replace a partial one in the records", () => {
+    const { records, tailRecords } = dedupeWithinFile(
+      [output(1)],
+      [output(999), output(7, "msg_2:")],
+    );
+
+    expect(records.map((kept) => kept.totals.outputTokens)).toEqual([999]);
+    expect(tailRecords.map((kept) => kept.totals.outputTokens)).toEqual([7]);
   });
 
   it("keeps every record that has no dedupe key", () => {
     expect(
-      dedupeWithinFile([record({ dedupeKey: null }), record({ dedupeKey: null })]),
+      dedupeWithinFile([record({ dedupeKey: null }), record({ dedupeKey: null })]).records,
     ).toHaveLength(2);
   });
 });

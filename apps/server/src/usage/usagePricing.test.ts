@@ -50,6 +50,32 @@ describe("usage pricing", () => {
     expect(cacheSavingsUsd(table, record("example-model"), overrides)).toBe(1.5);
   });
 
+  it("prices 1-hour cache writes at the published 1-hour rate", () => {
+    const table = parseRateTable({
+      "claude-opus-5-5": {
+        input_cost_per_token: 4e-6,
+        output_cost_per_token: 2e-5,
+        cache_read_input_token_cost: 2e-7,
+        cache_creation_input_token_cost: 5e-6,
+        cache_creation_input_token_cost_above_1hr: 8e-6,
+      },
+      "no-1h-rate": { ...rate(4e-6, 2e-7), cache_creation_input_token_cost: 5e-6 },
+    });
+    const cacheWrites = {
+      totals: { ...totals, uncachedInputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      cacheCreation1hTokens: 600_000,
+      reportedCostUsd: null,
+      fast: false,
+    };
+
+    // 400k at the 5-minute rate plus 600k at the 1-hour rate.
+    expect(priceUsage(table, { ...cacheWrites, model: "claude-opus-5-5" }).costUsd).toBeCloseTo(
+      6.8,
+      9,
+    );
+    expect(priceUsage(table, { ...cacheWrites, model: "no-1h-rate" }).costUsd).toBeCloseTo(5, 9);
+  });
+
   it("prices Cursor cache savings at the base model rate", () => {
     const table = parseRateTable({
       "claude-fable-5-1": rate(10e-6, 1e-6),

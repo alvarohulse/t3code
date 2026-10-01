@@ -285,11 +285,6 @@ describe("UsageService", () => {
           environment: { AGENT_CLI_CREDENTIAL_STORE: "memory" },
           authPath: ["config", "cursor", "auth.json"],
         },
-        {
-          platform: "linux" as const,
-          environment: { CURSOR_API_KEY: "different-account" },
-          authPath: ["config", "cursor", "auth.json"],
-        },
       ].entries()) {
         const authPath = NodePath.join(home, ...testCase.authPath);
         yield* Effect.promise(async () => {
@@ -316,6 +311,40 @@ describe("UsageService", () => {
         assert.include(cursor?.message ?? "", "Cursor CLI login");
         assert.isFalse(summary.buckets.some((bucket) => bucket.provider === "cursor"));
       }
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("reads Cursor credentials from the Cursor provider's environment settings", () =>
+    Effect.gen(function* () {
+      const { settings, home } = yield* setup;
+      const authPath = NodePath.join(home, "config", "cursor", "auth.json");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(NodePath.dirname(authPath), { recursive: true });
+        await NodeFSP.writeFile(authPath, encodeUnknownJsonString({ accessToken: "stale-token" }));
+      });
+      const service = yield* UsageService.make.pipe(
+        Effect.provide(
+          serviceLayers({
+            prefix: "usage-service-cursor-instance-environment",
+            home,
+            settings: {
+              ...settings,
+              providerInstances: {
+                [ProviderInstanceId.make("cursor")]: {
+                  driver: ProviderDriverKind.make("cursor"),
+                  environment: [
+                    { name: "AGENT_CLI_CREDENTIAL_STORE", value: "memory", sensitive: false },
+                  ],
+                },
+              },
+            },
+          }),
+        ),
+      );
+      const summary = yield* service.readSummary(WINDOW);
+      const cursor = summary.sources.find((source) => source.fingerprint.provider === "cursor");
+      assert.strictEqual(cursor?.status, "missing");
+      assert.include(cursor?.message ?? "", "Cursor CLI login");
     }).pipe(Effect.scoped),
   );
 

@@ -12,6 +12,7 @@ import {
   elapsedShare,
   formatDuration,
   formatResetsIn,
+  formatSpendUsed,
   type LimitPace,
   paceOf,
   remainingPercent,
@@ -132,6 +133,11 @@ function WindowBar({
           <span className="text-foreground">
             {remaining}% left{timeLeft !== null ? ` · ${timeLeft}% of the window left` : ""}
           </span>
+          {window.spend ? (
+            <span className="text-muted-foreground tabular-nums">
+              {formatSpendUsed(window.spend)} billed
+            </span>
+          ) : null}
           {timeLeft !== null ? (
             <span className="text-muted-foreground">The line is where even spending would be.</span>
           ) : null}

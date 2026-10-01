@@ -17,9 +17,11 @@ import {
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
   type UsageLimitSourceSnapshots,
+  UsageProviderKind,
 } from "@t3tools/contracts";
 
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -136,17 +138,26 @@ export function collectExternalUsageLinks(presentations: LimitPresentations) {
   return [...links.values()];
 }
 
-/** Prefer the reported email; use an identical credential when no email is available. */
+/** Every identity that names the account: the reported email first, then the read's own identity. */
+function accountKeys(
+  driver: ServerProvider["driver"],
+  email: string | undefined,
+  limits?: ServerProviderUsageLimits,
+): string[] {
+  const keys: string[] = [];
+  const normalizedEmail = email?.trim().toLowerCase();
+  if (normalizedEmail) keys.push(`${driver}:${normalizedEmail}`);
+  if (limits?.credentialFingerprint)
+    keys.push(`${driver}:credential:${limits.credentialFingerprint}`);
+  return keys;
+}
+
 function accountKey(
   driver: ServerProvider["driver"],
   email: string | undefined,
   limits?: ServerProviderUsageLimits,
 ): string | null {
-  const normalizedEmail = email?.trim().toLowerCase();
-  if (normalizedEmail) return `${driver}:${normalizedEmail}`;
-  return limits?.credentialFingerprint
-    ? `${driver}:credential:${limits.credentialFingerprint}`
-    : null;
+  return accountKeys(driver, email, limits)[0] ?? null;
 }
 
 /**
@@ -187,6 +198,17 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
   const accounts = new Map<string, LimitAccount>();
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
+  // A CLI can drop its email between checks while the limits read still names
+  // the account, so either identity joins a report to an account seen before.
+  const aliases = new Map<string, string>();
+  const resolveKey = (identities: readonly string[], fallback: string) => {
+    const key =
+      identities.map((identity) => aliases.get(identity)).find((known) => known !== undefined) ??
+      identities[0] ??
+      fallback;
+    for (const identity of identities) if (!aliases.has(identity)) aliases.set(identity, key);
+    return key;
+  };
   const merge = (key: string, next: LimitAccount) => {
     // Redeeming through a hub also clears the routing cooldown that hub holds
     // for the account. Redeeming natively against the same subscription resets
@@ -251,8 +273,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (!provider.usageLimits || limitsNotice(provider.usageLimits) !== null) continue;
       merge(
-        accountKey(provider.driver, provider.auth.email, provider.usageLimits) ??
+        resolveKey(
+          accountKeys(provider.driver, provider.auth.email, provider.usageLimits),
           `${environmentId}:${provider.instanceId}`,
+        ),
         {
           key: `${environmentId}:${provider.instanceId}`,
           driver: provider.driver,
@@ -280,8 +304,10 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       for (const account of source.accounts) {
         if (limitsNotice(account.usageLimits) !== null) continue;
         merge(
-          accountKey(account.driver, account.email, account.usageLimits) ??
+          resolveKey(
+            accountKeys(account.driver, account.email, account.usageLimits),
             `${source.id}:${account.id}`,
+          ),
           {
             key: `${source.id}:${account.id}`,
             driver: account.driver,
@@ -363,6 +389,8 @@ export interface LimitPoolWindow {
   }>;
   readonly remainingPercent: number;
   readonly usedPercent: number;
+  /** Summed dollars, only when every member reports them; a partial sum would understate the pool. */
+  readonly spend: ServerProviderUsageWindow["spend"];
   readonly pace: LimitPace | null;
   readonly resets: ReadonlyArray<{
     readonly member: LimitPoolMember;
@@ -491,11 +519,47 @@ function poolWindows(accounts: readonly LimitAccount[], now: number): readonly L
       ),
       usedPercent: Math.round(usedPercent),
       remainingPercent: Math.round(100 - usedPercent),
+      spend: poolSpend(members),
       pace: meanElapsed === null ? null : paceOfShares(timedUsed, meanElapsed),
       resets,
     };
   });
   return pools.sort((left, right) => WINDOW_KIND_ORDER[left.kind] - WINDOW_KIND_ORDER[right.kind]);
+}
+
+function poolSpend(members: readonly LimitPoolMember[]): ServerProviderUsageWindow["spend"] {
+  let usedUsd = 0;
+  let limitUsd = 0;
+  for (const { window } of members) {
+    if (!window.spend) return undefined;
+    usedUsd += window.spend.usedUsd;
+    limitUsd += window.spend.limitUsd;
+  }
+  return { usedUsd, limitUsd };
+}
+
+const isUsageProviderKind = Schema.is(UsageProviderKind);
+
+/**
+ * The first window per provider that it bills in dollars, pooled across
+ * accounts and keyed the way the Usage page keys its rows. The page shows it
+ * beside its own estimate, since a provider's billing period rarely matches
+ * the page's date range.
+ */
+export function billedSpendByUsageProvider(
+  pools: readonly LimitPool[],
+): ReadonlyMap<UsageProviderKind, LimitPoolWindow & { spend: object }> {
+  const billed = new Map<UsageProviderKind, LimitPoolWindow & { spend: object }>();
+  for (const pool of pools) {
+    const driver: string = pool.driver === "claudeAgent" ? "claude" : pool.driver;
+    if (!isUsageProviderKind(driver)) continue;
+    const window = pool.windows.find(
+      (candidate): candidate is LimitPoolWindow & { spend: object } =>
+        candidate.spend !== undefined,
+    );
+    if (window) billed.set(driver, window);
+  }
+  return billed;
 }
 
 /** The one-line status under a provider heading when there are no bars to draw. */
@@ -507,6 +571,22 @@ export function limitsNotice(limits: ServerProviderUsageLimits): string | null {
     return limits.unavailable.message ?? "Could not read limits.";
   }
   return limits.windows.length === 0 ? "No limits reported." : null;
+}
+
+const WHOLE_USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 0,
+});
+
+/** `$1,124 left of $5,000`: what remains of a metered window's dollar budget. */
+export function formatSpendLeft(spend: NonNullable<ServerProviderUsageWindow["spend"]>): string {
+  return `${WHOLE_USD.format(Math.max(0, spend.limitUsd - spend.usedUsd))} left of ${WHOLE_USD.format(spend.limitUsd)}`;
+}
+
+/** `$3,876 of $5,000`: what a metered window has billed so far. */
+export function formatSpendUsed(spend: NonNullable<ServerProviderUsageWindow["spend"]>): string {
+  return `${WHOLE_USD.format(spend.usedUsd)} of ${WHOLE_USD.format(spend.limitUsd)}`;
 }
 
 /** Quota left in the window, 0..100. Bars and labels show what remains, as Codex does. */

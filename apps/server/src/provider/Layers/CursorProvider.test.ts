@@ -1037,9 +1037,12 @@ describe("Cursor usage limits", () => {
           '{"accessToken":"instance-token"}',
         );
         const client = HttpClient.make((request) => {
-          expect(request.url).toBe(
-            "https://cursor.example/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-          );
+          expect(
+            request.url.startsWith("https://cursor.example/aiserver.v1.DashboardService/"),
+          ).toBe(true);
+          if (!request.url.endsWith("/GetCurrentPeriodUsage")) {
+            return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({})));
+          }
           expect(request.method).toBe("POST");
           expect(request.headers.authorization).toBe("Bearer instance-token");
           expect(request.headers["connect-protocol-version"]).toBe("1");
@@ -1199,15 +1202,131 @@ describe("Cursor usage limits", () => {
     });
   });
 
-  it("does not use a stored login for an explicit API key", async () => {
+  it("reads limits for the account an explicit API key names, not the stored login", async () => {
+    const urls: string[] = [];
     const limits = await runNode(
       readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_API_KEY: "different-account" }).pipe(
         Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.makeNoop({
+            readFileString: () => Effect.die("must not read the stored login"),
+          }),
+        ),
+        Effect.provideService(
           HttpClient.HttpClient,
-          HttpClient.make(() => Effect.die("must not request usage")),
+          HttpClient.make((request) => {
+            urls.push(request.url);
+            if (request.url.endsWith("/auth/exchange_user_api_key")) {
+              expect(request.headers.authorization).toBe("Bearer different-account");
+              return Effect.succeed(
+                HttpClientResponse.fromWeb(request, Response.json({ accessToken: "key-token" })),
+              );
+            }
+            expect(request.headers.authorization).toBe("Bearer key-token");
+            return Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json({ planUsage: { totalPercentUsed: 73 } }),
+              ),
+            );
+          }),
         ),
       ),
     );
-    expect(limits.unavailable?.reason).toBe("unsupported");
+    expect(limits.windows[0]?.usedPercent).toBe(73);
+    expect(urls).toEqual([
+      "https://api2.cursor.sh/auth/exchange_user_api_key",
+      "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+      "https://api2.cursor.sh/aiserver.v1.DashboardService/GetTeams",
+    ]);
+  });
+
+  it("shows a team's per-user spend limit in dollars when Cursor reports no plan percentages", async () => {
+    const methods: string[] = [];
+    const limits = await runNode(
+      readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_AUTH_TOKEN: "team-token" }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) => {
+            const method = request.url.split("/").at(-1)!;
+            methods.push(method);
+            const body = {
+              GetCurrentPeriodUsage: { billingCycleEnd: "1790812800000", displayThreshold: 0 },
+              GetTeams: {
+                teams: [
+                  { id: 1, hasBilling: false },
+                  {
+                    id: 7,
+                    hasBilling: true,
+                    billingCycleStart: "1788220800000",
+                    billingCycleEnd: "1790812800000",
+                  },
+                ],
+              },
+              GetAggregatedUsageEvents: { totalCostCents: 387_612 },
+              GetHardLimit: { perUserMonthlyLimitDollars: 5000 },
+            }[method];
+            return Effect.succeed(
+              body
+                ? HttpClientResponse.fromWeb(request, Response.json(body))
+                : HttpClientResponse.fromWeb(request, new Response("", { status: 404 })),
+            );
+          }),
+        ),
+      ),
+    );
+    expect(limits.unavailable).toBeUndefined();
+    expect(limits.windows).toEqual([
+      {
+        id: "spendLimit",
+        kind: "monthly",
+        label: "Spend limit",
+        usedPercent: 77.5224,
+        resetsAt: "2026-10-01T00:00:00.000Z",
+        windowDurationMins: 30 * 24 * 60,
+        spend: { usedUsd: 3876.12, limitUsd: 5000 },
+      },
+    ]);
+    expect(methods).not.toContain("GetTeamSpend");
+  });
+
+  it("keeps plan percentages when the spend limit cannot be read", async () => {
+    const limits = await runNode(
+      readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_AUTH_TOKEN: "pro-token" }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(
+              request.url.endsWith("/GetCurrentPeriodUsage")
+                ? HttpClientResponse.fromWeb(
+                    request,
+                    Response.json({ planUsage: { totalPercentUsed: 40 } }),
+                  )
+                : HttpClientResponse.fromWeb(request, new Response("", { status: 403 })),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(limits.windows.map((window) => window.id)).toEqual(["totalPercentUsed"]);
+  });
+
+  it("reports a rejected API key without exposing it", async () => {
+    const limits = await runNode(
+      readCursorUsageLimits({ apiEndpoint: "" }, { CURSOR_API_KEY: "revoked-key" }).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response("revoked-key", { status: 401 })),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(limits.unavailable).toEqual({
+      reason: "probeFailed",
+      message: "Cursor could not read usage limits.",
+    });
   });
 });

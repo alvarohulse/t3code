@@ -2,7 +2,15 @@ import { ChatGptUsageSummary } from "./ChatGptUsageSummary";
 import { ScreenScrollView as ScrollView } from "../../components/ScreenScrollView";
 import { EnvironmentId, USAGE_CONTRACT_VERSION } from "@t3tools/contracts";
 import { type RouteProp, useIsFocused, useNavigation, useRoute } from "@react-navigation/native";
+import { useAtomValue } from "@effect/atom-react";
 import { cursorKeychainAccessEnvironments } from "@t3tools/client-runtime/state/usage";
+import {
+  billedSpendByUsageProvider,
+  collectLimitAccounts,
+  collectLimitPools,
+  formatResetsIn,
+  formatSpendUsed,
+} from "@t3tools/shared/usageLimits";
 import {
   isCompatibleUsageContractVersion,
   isModelCostUnknown,
@@ -33,6 +41,7 @@ import { ProviderIcon } from "../../components/ProviderIcon";
 import { cn } from "../../lib/cn";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import { useUsage, type EnvironmentUsageStatus } from "../../state/usage";
+import { environmentPresentations } from "../../state/presentation";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsSection } from "../settings/components/SettingsSection";
@@ -360,6 +369,8 @@ export function UsageRouteScreen() {
                   <ProviderSection
                     merged={merged}
                     metric={metric}
+                    now={limits.now}
+                    selectedEnvironmentIds={selectedEnvironmentIds}
                     cursorAccessEnvironments={cursorAccessEnvironments}
                     showCursorEnvironment={selectedEnvironments.length > 1}
                     onCursorEnabled={refreshAfterCursorEnable}
@@ -555,13 +566,28 @@ function ChartCard(props: {
 
 function ProviderSection(props: {
   readonly merged: MergedUsage;
+  readonly selectedEnvironmentIds: ReadonlySet<EnvironmentId> | null;
+  readonly now: number;
   readonly metric: UsageChartMetric;
   readonly cursorAccessEnvironments: readonly EnvironmentUsageStatus[];
   readonly showCursorEnvironment: boolean;
   readonly onCursorEnabled: () => void;
 }) {
-  const { merged, metric } = props;
+  const { merged, metric, now, selectedEnvironmentIds } = props;
   const colors = useProviderColors();
+  const presentations = useAtomValue(environmentPresentations.presentationsAtom);
+  // What metered providers bill for their own period, from the same limits
+  // snapshots as the Limits tab; the estimate covers the page's range.
+  const billedSpend = billedSpendByUsageProvider(
+    collectLimitPools(
+      collectLimitAccounts(
+        selectedEnvironmentIds === null
+          ? presentations
+          : new Map([...presentations].filter(([id]) => selectedEnvironmentIds.has(id))),
+      ),
+      now,
+    ),
+  );
   if (merged.providers.length === 0 && props.cursorAccessEnvironments.length === 0) return null;
 
   // Ranked by whatever the toggle is showing, so the rows always descend.
@@ -604,6 +630,10 @@ function ProviderSection(props: {
         }
         const provider = row.provider;
         const share = metric === "cost" ? provider.costShare : provider.tokenShare;
+        const billed = billedSpend.get(provider.provider);
+        const billedResets = billed?.members[0]
+          ? formatResetsIn(billed.members[0].window, now)
+          : null;
         return (
           <View
             key={provider.provider}
@@ -635,6 +665,12 @@ function ProviderSection(props: {
                 ? `${formatPercent(share)} of cost · ${formatTokens(provider.totalTokens)} tokens`
                 : `${formatPercent(share)} of tokens · ${formatUsd(provider.costUsd)}`}
             </Text>
+            {metric === "cost" && billed ? (
+              <Text className="text-sm tabular-nums text-foreground">
+                {formatSpendUsed(billed.spend)} billed this period
+                {billedResets ? ` · ${billedResets}` : ""}
+              </Text>
+            ) : null}
           </View>
         );
       })}
