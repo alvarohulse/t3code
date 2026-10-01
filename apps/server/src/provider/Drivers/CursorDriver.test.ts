@@ -8,12 +8,13 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import { HttpClient } from "effect/unstable/http";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { writeFakeCli } from "../../testUtils/fakeCli.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { CursorDriver } from "./CursorDriver.ts";
 
@@ -95,5 +96,52 @@ it.layer(testLayer)("CursorDriver", (it) => {
       ),
       Effect.scoped,
     ),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "keeps reading limits when the CLI reports a working login as logged out",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cursor-driver-" });
+        // `agent about` intermittently prints this for a login that works.
+        const binaryPath = writeFakeCli({
+          directory: tempDir,
+          name: "cursor-agent",
+          source: [
+            'if (process.argv[2] === "about") {',
+            '  process.stdout.write("CLI Version         2026.09.28-64d2043\\n");',
+            '  process.stdout.write("User Email          Not logged in\\n");',
+            "  process.exit(0);",
+            "}",
+            "process.exit(1);",
+          ].join("\n"),
+        });
+        const httpClient = HttpClient.make((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              request.url.endsWith("/GetCurrentPeriodUsage")
+                ? Response.json({ planUsage: { totalPercentUsed: 42 } })
+                : new Response(null, { status: 404 }),
+            ),
+          ),
+        );
+
+        const instance = yield* CursorDriver.create({
+          instanceId: ProviderInstanceId.make("cursor-flaky-login"),
+          displayName: "Cursor test",
+          enabled: true,
+          environment: [
+            { name: "CURSOR_AUTH_TOKEN", value: "test-token", sensitive: true },
+            { name: "HOME", value: tempDir, sensitive: false },
+          ],
+          config: { ...CursorDriver.defaultConfig(), binaryPath },
+        }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
+
+        const snapshot = yield* instance.snapshot.refresh;
+        expect(snapshot.auth.status).toBe("unauthenticated");
+        expect(snapshot.usageLimits?.windows[0]?.usedPercent).toBe(42);
+      }).pipe(Effect.scoped),
   );
 });

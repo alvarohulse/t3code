@@ -140,13 +140,11 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         processEnv,
         modelDiscovery.discover,
       ).pipe(
+        // Limits use their own credential rather than the CLI's sign-in answer:
+        // `agent about` intermittently reports a working API key as logged out,
+        // which would otherwise wipe the published limits until the next check.
         Effect.filterOrElse(
-          (snapshot) =>
-            !(
-              effectiveConfig.enabled &&
-              snapshot.installed &&
-              snapshot.auth.status === "authenticated"
-            ),
+          (snapshot) => !(effectiveConfig.enabled && snapshot.installed),
           (snapshot) =>
             Effect.gen(function* () {
               const settings = yield* serverSettings.getSettings;
@@ -155,6 +153,10 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
                 processEnv,
                 settings.cursorKeychainUsageEnabled,
               );
+              // A signed-out CLI shows limits only when they were actually read.
+              if (snapshot.auth.status !== "authenticated" && usageLimits.unavailable) {
+                return snapshot;
+              }
               return { ...snapshot, usageLimits };
             }),
         ),
