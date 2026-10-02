@@ -26,7 +26,6 @@ const CLIENT_PRESENTATION_LAYER = Layer.succeed(
       deviceType: "desktop",
       os: "Test OS",
     },
-    scopes: AuthStandardClientScopes,
   }),
 );
 
